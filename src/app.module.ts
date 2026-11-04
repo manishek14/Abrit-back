@@ -4,7 +4,12 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { parseEnv } from './config/env';
 import { buildTypeOrmOptions } from './config/typeorm.config';
 import { DatabaseInitService } from './database/database-init.service';
+import { EventsModule } from './common/events/events.module';
 import { HealthModule } from './modules/health/health.module';
+import { UsersModule } from './modules/users/users.module';
+import { TicketsModule } from './modules/tickets/tickets.module';
+import { MessagesModule } from './modules/messages/messages.module';
+import { InboxModule } from './modules/inbox/inbox.module';
 
 @Module({
   imports: [
@@ -18,6 +23,11 @@ import { HealthModule } from './modules/health/health.module';
     TypeOrmModule.forRootAsync({
       useFactory: () => buildTypeOrmOptions(),
     }),
+    EventsModule,
+    UsersModule,
+    TicketsModule,
+    MessagesModule,
+    InboxModule,
     HealthModule,
   ],
   providers: [DatabaseInitService],
