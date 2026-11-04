@@ -36,7 +36,11 @@ export class OutboxDispatcherService implements OnModuleInit {
   onModuleInit(): void {
     this.events.on('message.created', ({ message }) => {
       if (isOutboundPending(message)) {
-        void this.deliver(message);
+        void this.deliver(message).catch((e) =>
+          this.logger.warn(
+            `immediate delivery failed for message ${message.id} (sweeper will retry): ${(e as Error).message}`,
+          ),
+        );
       }
     });
   }

@@ -1,0 +1,31 @@
+import { TelegramApiError, TelegramGateway } from '../../src/modules/telegram/telegram-gateway.interface';
+import { RawTelegramUpdate } from '../../src/modules/telegram/types';
+
+/**
+ * In-memory Telegram transport for tests: records every outbound send and can
+ * simulate failures. No test ever talks to the real Telegram API.
+ */
+export class FakeTelegramGateway implements TelegramGateway {
+  readonly active = true;
+  public sent: { chat_id: string; text: string }[] = [];
+  public failNext = false;
+  private counter = 100_000;
+
+  async sendMessage(params: { chat_id: string; text: string }): Promise<{ message_id: string }> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new TelegramApiError('simulated telegram failure', 500, false);
+    }
+    this.sent.push(params);
+    return { message_id: String(this.counter++) };
+  }
+
+  setUpdateHandler(_handler: (update: RawTelegramUpdate) => Promise<void>): void {
+    /* tests drive the pipeline through the webhook endpoint */
+  }
+
+  reset(): void {
+    this.sent = [];
+    this.failNext = false;
+  }
+}
