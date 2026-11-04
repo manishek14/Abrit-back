@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { parseEnv } from './config/env';
 import { buildTypeOrmOptions } from './config/typeorm.config';
+import { DatabaseInitService } from './database/database-init.service';
 import { HealthModule } from './modules/health/health.module';
 
 @Module({
@@ -19,5 +20,6 @@ import { HealthModule } from './modules/health/health.module';
     }),
     HealthModule,
   ],
+  providers: [DatabaseInitService],
 })
 export class AppModule {}
