@@ -111,17 +111,29 @@ export class MessagesService {
     return this.repo.findOneBy({ id });
   }
 
-  /** Outbox scan for the sweeper: PENDING + retryable FAILED, capped attempts. */
-  async findDueOutbox(limit = 20): Promise<Message[]> {
-    return this.repo
+  /** Outbox scan for the sweeper: PENDING + retryable FAILED, capped attempts,
+   *  retry_after deferrals respected, optionally skipping fresh rows that the
+   *  immediate dispatcher may still be sending. */
+  async findDueOutbox(
+    limit = 20,
+    opts: { freshWindowMs?: number } = {},
+  ): Promise<Message[]> {
+    const qb = this.repo
       .createQueryBuilder('m')
       .where('m.delivery_status IN (:...statuses)', {
         statuses: [DeliveryStatus.PENDING, DeliveryStatus.FAILED],
       })
       .andWhere('m.delivery_attempts < :max', { max: MAX_DELIVERY_ATTEMPTS })
+      .andWhere(
+        `NOT (m.meta ->> 'retry_after_until' IS NOT NULL AND (m.meta ->> 'retry_after_until')::timestamptz > now())`,
+      )
       .orderBy('m.id', 'ASC')
-      .take(limit)
-      .getMany();
+      .take(limit);
+
+    if (opts.freshWindowMs) {
+      qb.andWhere('m.created_at < :cutoff', { cutoff: new Date(Date.now() - opts.freshWindowMs) });
+    }
+    return qb.getMany();
   }
 
   async markSent(messageId: string, telegram_message_id: string | null): Promise<Message> {
@@ -153,6 +165,37 @@ export class MessagesService {
     const updated = await this.repo.findOneByOrFail({ id: messageId });
     this.events.emit('message.updated', { message: updated });
     return updated;
+  }
+
+  /** Terminal failure (403 blocked / chat not found / telegram disabled) — sweeper stops retrying. */
+  async markPermanentlyFailed(messageId: string, error: string): Promise<void> {
+    await this.repo.update(
+      { id: messageId },
+      {
+        delivery_status: DeliveryStatus.FAILED,
+        error: error.slice(0, 500),
+        delivery_attempts: MAX_DELIVERY_ATTEMPTS,
+      },
+    );
+    const updated = await this.repo.findOneByOrFail({ id: messageId });
+    this.events.emit('message.updated', { message: updated });
+  }
+
+  /** Telegram 429 — park the message until retry_after elapses (meta.retry_after_until). */
+  async deferRetry(messageId: string, retryAfterSeconds: number): Promise<void> {
+    const current = await this.repo.findOneByOrFail({ id: messageId });
+    const until = new Date(Date.now() + retryAfterSeconds * 1000);
+    await this.repo.update(
+      { id: messageId },
+      {
+        delivery_status: DeliveryStatus.FAILED,
+        error: `rate limited by Telegram — retry after ${retryAfterSeconds}s`,
+        delivery_attempts: current.delivery_attempts + 1,
+        meta: { ...(current.meta ?? {}), retry_after_until: until.toISOString() },
+      },
+    );
+    const updated = await this.repo.findOneByOrFail({ id: messageId });
+    this.events.emit('message.updated', { message: updated });
   }
 
   private async touchTicket(ticket_id: string): Promise<void> {

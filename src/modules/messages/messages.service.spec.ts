@@ -164,7 +164,7 @@ describe('MessagesService', () => {
   });
 
   describe('findDueOutbox', () => {
-    it('scans only PENDING/FAILED rows below the attempt cap', async () => {
+    it('scans only PENDING/FAILED rows below the attempt cap and respects retry_after', async () => {
       const qb = {
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
@@ -174,13 +174,47 @@ describe('MessagesService', () => {
       };
       repo.createQueryBuilder.mockReturnValueOnce(qb);
 
-      const due = await service.findDueOutbox(10);
+      const due = await service.findDueOutbox(10, { freshWindowMs: 5_000 });
       expect(due).toEqual([]);
       expect(qb.where).toHaveBeenCalledWith(
         'm.delivery_status IN (:...statuses)',
         { statuses: [DeliveryStatus.PENDING, DeliveryStatus.FAILED] },
       );
       expect(qb.andWhere).toHaveBeenCalledWith('m.delivery_attempts < :max', { max: 5 });
+      expect(qb.andWhere).toHaveBeenCalledWith(expect.stringContaining('retry_after_until'));
+      expect(qb.andWhere).toHaveBeenCalledWith('m.created_at < :cutoff', { cutoff: expect.any(Date) });
+    });
+  });
+
+  describe('permanent failure & rate-limit deferral', () => {
+    it('markPermanentlyFailed caps attempts so the sweeper never retries again', async () => {
+      repo.findOneByOrFail.mockResolvedValue(mkMessage());
+
+      await service.markPermanentlyFailed('m-1', 'user blocked the bot');
+
+      expect(repo.update).toHaveBeenCalledWith(
+        { id: 'm-1' },
+        expect.objectContaining({ delivery_status: DeliveryStatus.FAILED, delivery_attempts: 5 }),
+      );
+      expect(events.emit).toHaveBeenCalledWith('message.updated', expect.anything());
+    });
+
+    it('deferRetry parks a 429 message with retry_after_until in meta', async () => {
+      repo.findOneByOrFail.mockResolvedValue(mkMessage({ meta: { model: 'x' } }));
+
+      await service.deferRetry('m-1', 30);
+
+      expect(repo.update).toHaveBeenCalledWith(
+        { id: 'm-1' },
+        expect.objectContaining({
+          delivery_status: DeliveryStatus.FAILED,
+          delivery_attempts: 1,
+          meta: expect.objectContaining({
+            model: 'x',
+            retry_after_until: expect.any(String),
+          }),
+        }),
+      );
     });
   });
 });

@@ -3,6 +3,7 @@ import { Brackets, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { escapeLike, Paginated, toPaginated } from '../../common/pagination';
+import { firstRawRow } from '../../common/utils/raw-rows';
 
 export interface UpsertTelegramUserInput {
   telegram_id: string;
@@ -27,7 +28,7 @@ export class UsersService {
    * telegram_id for private chats and is stored independently (owner's request).
    */
   async upsertTelegramUser(input: UpsertTelegramUserInput): Promise<TelegramUser> {
-    const [row] = await this.repo.query(
+    const rows = await this.repo.query(
       `INSERT INTO telegram_users
          (telegram_id, chat_id, username, first_name, last_name, language_code, last_seen_at)
        VALUES ($1, $2, $3, $4, $5, $6, now())
@@ -49,7 +50,7 @@ export class UsersService {
         input.language_code ?? null,
       ],
     );
-    return row as TelegramUser;
+    return firstRawRow<TelegramUser>(rows) as TelegramUser;
   }
 
   async findByTelegramId(telegram_id: string): Promise<TelegramUser | null> {

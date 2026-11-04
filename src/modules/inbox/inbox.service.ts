@@ -3,6 +3,7 @@ import { Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { BotUpdate } from '../../database/entities/bot-update.entity';
 import { BotUpdateStatus } from '../../database/enums';
+import { firstRawRow } from '../../common/utils/raw-rows';
 
 /**
  * Telegram inbox (bot_updates). Ingest is INSERT … ON CONFLICT DO NOTHING — a
@@ -25,7 +26,7 @@ export class InboxService {
        RETURNING *`,
       [update_id, JSON.stringify(payload)],
     );
-    return (rows[0] as BotUpdate | undefined) ?? null;
+    return firstRawRow<BotUpdate>(rows);
   }
 
   /** Atomic claim — 0 rows means another worker owns this update. */
@@ -37,7 +38,7 @@ export class InboxService {
        RETURNING *`,
       [update_id],
     );
-    return (rows[0] as BotUpdate | undefined) ?? null;
+    return firstRawRow<BotUpdate>(rows);
   }
 
   async markDone(update_id: string): Promise<void> {
@@ -63,21 +64,28 @@ export class InboxService {
    * go back to RECEIVED while attempts < maxAttempts, otherwise become FAILED.
    */
   async requeueStale(staleMs: number, maxAttempts: number): Promise<number> {
-    const requeued = await this.repo.query(
-      `UPDATE bot_updates SET status='RECEIVED', locked_at=NULL
-        WHERE status='PROCESSING'
-          AND locked_at < now() - make_interval(ms => $1::int)
-          AND attempts < $2::int`,
-      [staleMs, maxAttempts],
-    );
-    const failed = await this.repo.query(
-      `UPDATE bot_updates SET status='FAILED', last_error='abandoned: stale lock after max attempts'
-        WHERE status='PROCESSING'
-          AND locked_at < now() - make_interval(ms => $1::int)
-          AND attempts >= $2::int`,
-      [staleMs, maxAttempts],
-    );
-    return (requeued.rowCount ?? 0) + (failed.rowCount ?? 0);
+    const cutoff = new Date(Date.now() - staleMs);
+
+    const requeued = await this.repo
+      .createQueryBuilder()
+      .update()
+      .set({ status: BotUpdateStatus.RECEIVED, locked_at: null })
+      .where("status = 'PROCESSING' AND locked_at < :cutoff", { cutoff })
+      .andWhere('attempts < :max', { max: maxAttempts })
+      .execute();
+
+    const failed = await this.repo
+      .createQueryBuilder()
+      .update()
+      .set({
+        status: BotUpdateStatus.FAILED,
+        last_error: 'abandoned: stale lock after max attempts',
+      })
+      .where("status = 'PROCESSING' AND locked_at < :cutoff", { cutoff })
+      .andWhere('attempts >= :max', { max: maxAttempts })
+      .execute();
+
+    return (requeued.affected ?? 0) + (failed.affected ?? 0);
   }
 
   async findReceived(limit = 50): Promise<BotUpdate[]> {

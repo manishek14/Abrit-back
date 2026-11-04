@@ -88,7 +88,11 @@ export class TicketsService {
    * Rules (plan §6): same status = no-op 200; unknown status = 400; reopening a CLOSED
    * ticket is allowed only if the user has no other active ticket (409 otherwise).
    */
-  async changeStatus(ticketId: string, newStatus: TicketStatus): Promise<ChangeStatusResult> {
+  async changeStatus(
+    ticketId: string,
+    newStatus: TicketStatus,
+    by: 'ADMIN' | 'USER' = 'ADMIN',
+  ): Promise<ChangeStatusResult> {
     if (!Object.values(TicketStatus).includes(newStatus)) {
       throw new BadRequestException(`Invalid ticket status: ${String(newStatus)}`);
     }
@@ -120,7 +124,10 @@ export class TicketsService {
         updated_at: new Date(),
       });
 
-      const content = `وضعیت تیکت ${ticket.ticket_number} توسط کارشناس پشتیبانی به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`;
+      const content =
+        by === 'USER'
+          ? `تیکت ${ticket.ticket_number} به درخواست شما به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`
+          : `وضعیت تیکت ${ticket.ticket_number} توسط کارشناس پشتیبانی به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`;
       const msgRepo = manager.getRepository(Message);
       const systemMessage = await msgRepo.save(
         msgRepo.create({

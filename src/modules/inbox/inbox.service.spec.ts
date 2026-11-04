@@ -18,10 +18,10 @@ const mkUpdate = (over: Partial<BotUpdate> = {}): BotUpdate =>
 
 describe('InboxService', () => {
   let service: InboxService;
-  let repo: { query: jest.Mock; update: jest.Mock; find: jest.Mock };
+  let repo: { query: jest.Mock; update: jest.Mock; find: jest.Mock; createQueryBuilder: jest.Mock };
 
   beforeEach(() => {
-    repo = { query: jest.fn(), update: jest.fn(), find: jest.fn() };
+    repo = { query: jest.fn(), update: jest.fn(), find: jest.fn(), createQueryBuilder: jest.fn() };
     service = new InboxService(repo as unknown as Repository<BotUpdate>);
   });
 
@@ -76,9 +76,29 @@ describe('InboxService', () => {
   });
 
   it('requeueStale re-enqueues fresh rows and fails exhausted ones', async () => {
-    repo.query.mockResolvedValue({ rowCount: 2 });
+    const qb = {
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 2 }),
+    };
+    repo.createQueryBuilder.mockReturnValue(qb);
+
     const n = await service.requeueStale(120_000, 3);
+
     expect(n).toBe(4);
-    expect(repo.query).toHaveBeenCalledTimes(2);
+    expect(qb.execute).toHaveBeenCalledTimes(2);
+    expect(qb.where).toHaveBeenCalledWith(
+      "status = 'PROCESSING' AND locked_at < :cutoff",
+      { cutoff: expect.any(Date) },
+    );
+  });
+
+  it('ingest handles the nested UPDATE/RETURNING row shape transparently', async () => {
+    const row = mkUpdate({ update_id: '300', status: BotUpdateStatus.PROCESSING });
+    repo.query.mockResolvedValueOnce([[row]]); // nested shape TypeORM returns
+    const res = await service.ingest('300', {});
+    expect(res?.update_id).toBe('300');
   });
 });
