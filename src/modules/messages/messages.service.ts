@@ -107,6 +107,17 @@ export class MessagesService {
     return qb.take(options.limit ?? 1000).getMany();
   }
 
+  /** The LAST `limit` messages in chronological order — the AI context source for a ticket. */
+  async getRecentConversation(ticket_id: string, limit: number): Promise<Message[]> {
+    const rows = await this.repo
+      .createQueryBuilder('m')
+      .where('m.ticket_id = :ticket_id', { ticket_id })
+      .orderBy('m.id', 'DESC')
+      .take(limit)
+      .getMany();
+    return rows.reverse();
+  }
+
   async findById(id: string): Promise<Message | null> {
     return this.repo.findOneBy({ id });
   }

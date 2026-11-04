@@ -47,6 +47,8 @@ export const EnvSchema = z
     OPENROUTER_TIMEOUT_MS: z.coerce.number().int().min(1000).default(25000),
     AI_CONTEXT_MAX_MESSAGES: z.coerce.number().int().min(2).max(200).default(20),
     AI_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(3),
+    AI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(50).max(4000).default(500),
+    AI_CONTEXT_MAX_CHARS: z.coerce.number().int().min(2000).max(200_000).default(21_000),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.TELEGRAM_MODE === 'webhook') {
