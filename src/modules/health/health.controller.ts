@@ -7,12 +7,14 @@ import {
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
+import { Public } from '../../common/decorators/public.decorator';
 
 @Controller('health')
 export class HealthController {
   constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
 
   /** Public liveness probe — also verifies the DB connection. */
+  @Public()
   @Get()
   @HttpCode(HttpStatus.OK)
   async check(): Promise<{ status: string; db: string; time: string }> {

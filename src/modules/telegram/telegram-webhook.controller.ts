@@ -1,7 +1,18 @@
-import { Body, Controller, ForbiddenException, Headers, HttpCode, HttpStatus, Inject, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  ForbiddenException,
+  Headers,
+  HttpCode,
+  HttpStatus,
+  Inject,
+  Post,
+} from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { IngestService } from './ingest.service';
 import { RawTelegramUpdate } from './types';
+import { Public } from '../../common/decorators/public.decorator';
 
 export const TELEGRAM_WEBHOOK_SECRET = Symbol('TELEGRAM_WEBHOOK_SECRET');
 
@@ -10,6 +21,8 @@ export const TELEGRAM_WEBHOOK_SECRET = Symbol('TELEGRAM_WEBHOOK_SECRET');
  * Telegram secret token header, compared in constant time. Responds 200 as
  * soon as the update is persisted; Telegram never waits for the AI.
  */
+@Public()
+@SkipThrottle()
 @Controller('telegram')
 export class TelegramWebhookController {
   constructor(

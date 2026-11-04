@@ -9,11 +9,12 @@ import { Admin } from '../entities/admin.entity';
  */
 export async function seedAdmin(ds: DataSource, email: string, password: string): Promise<void> {
   const repo: Repository<Admin> = ds.getRepository(Admin);
-  const existing = await repo.findOne({ where: { email } });
+  const normalizedEmail = email.trim().toLowerCase();
+  const existing = await repo.findOne({ where: { email: normalizedEmail } });
   if (existing) return;
 
   await repo.insert({
-    email,
+    email: normalizedEmail,
     password_hash: bcrypt.hashSync(password, 10),
     name: 'Super Admin',
   });

@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { getEnv } from './config/env';
@@ -23,8 +24,18 @@ async function bootstrap(): Promise<void> {
     }),
   );
 
+  // Interactive API docs (Bearer-auth protected routes marked accordingly)
+  const swaggerConfig = new DocumentBuilder()
+    .setTitle('AbrIT Ticketing API')
+    .setDescription('AI-powered Telegram ticketing system — admin REST API')
+    .setVersion('0.1.0')
+    .addBearerAuth()
+    .build();
+  const document = SwaggerModule.createDocument(app, swaggerConfig);
+  SwaggerModule.setup('api/docs', app, document);
+
   await app.listen(env.PORT);
-  Logger.log(`AbrIT API listening on http://localhost:${env.PORT}/api`, 'Bootstrap');
+  Logger.log(`AbrIT API listening on http://localhost:${env.PORT}/api (docs: /api/docs)`, 'Bootstrap');
 }
 
 void bootstrap();
