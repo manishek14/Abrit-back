@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { BotUpdate } from '../../database/entities/bot-update.entity';
-import { BotUpdateStatus } from '../../database/enums';
+import { BotUpdateStage, BotUpdateStatus } from '../../database/enums';
 import { firstRawRow } from '../../common/utils/raw-rows';
 
 /**
@@ -33,12 +33,17 @@ export class InboxService {
   async claim(update_id: string): Promise<BotUpdate | null> {
     const rows = await this.repo.query(
       `UPDATE bot_updates
-         SET status = 'PROCESSING', locked_at = now(), attempts = attempts + 1
+         SET status = 'PROCESSING', locked_at = now(), attempts = attempts + 1, stage = 'CLAIMED'
        WHERE update_id = $1 AND status = 'RECEIVED'
        RETURNING *`,
       [update_id],
     );
     return firstRawRow<BotUpdate>(rows);
+  }
+
+  /** Records the last completed milestone (review fix #1) for observability + resume. */
+  async setStage(update_id: string, stage: BotUpdateStage): Promise<void> {
+    await this.repo.update({ update_id }, { stage });
   }
 
   async markDone(update_id: string): Promise<void> {
@@ -60,6 +65,18 @@ export class InboxService {
   }
 
   /**
+   * Review fix #4-b: processing errors are now PERSISTED on the row (status
+   * stays PROCESSING so the sweeper still retries; last_error + attempts make
+   * the failure observable in the database instead of only in logs).
+   */
+  async recordError(update_id: string, error: string): Promise<void> {
+    await this.repo.update(
+      { update_id },
+      { last_error: error.slice(0, 500) },
+    );
+  }
+
+  /**
    * Crash recovery (sweeper): PROCESSING rows stuck longer than `staleMs`
    * go back to RECEIVED while attempts < maxAttempts, otherwise become FAILED.
    */
@@ -74,12 +91,13 @@ export class InboxService {
       .andWhere('attempts < :max', { max: maxAttempts })
       .execute();
 
+    // keep the REAL last error if one was recorded — do not overwrite it
     const failed = await this.repo
       .createQueryBuilder()
       .update()
       .set({
         status: BotUpdateStatus.FAILED,
-        last_error: 'abandoned: stale lock after max attempts',
+        last_error: () => `COALESCE(NULLIF(bot_updates.last_error, ''), 'abandoned: stale lock after max attempts')`,
       })
       .where("status = 'PROCESSING' AND locked_at < :cutoff", { cutoff })
       .andWhere('attempts >= :max', { max: maxAttempts })
