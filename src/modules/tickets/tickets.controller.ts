@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -9,17 +10,41 @@ import {
   Query,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
+import { Type } from 'class-transformer';
 import { TicketsService } from './tickets.service';
 import { MessagesService } from '../messages/messages.service';
 import { ListTicketsQueryDto } from './dto/list-tickets-query.dto';
 import { UpdateTicketStatusDto } from './dto/update-ticket-status.dto';
 
+/** PostgreSQL bigint identities max out at 2^63-1 → at most 19 digits. */
+export const MESSAGE_ID_CURSOR_REGEX = /^\d{1,19}$/;
+
 export class TicketMessagesQueryDto {
+  /** Incremental refresh: return messages newer than this id. */
   @IsOptional()
   @IsString()
-  @MaxLength(20)
+  @MaxLength(19)
+  @Matches(MESSAGE_ID_CURSOR_REGEX, {
+    message: 'after must be a numeric message id (max 19 digits, PostgreSQL bigint)',
+  })
   after?: string;
+
+  /** Backward pagination: return the `limit` messages older than this id. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(19)
+  @Matches(MESSAGE_ID_CURSOR_REGEX, {
+    message: 'before must be a numeric message id (max 19 digits, PostgreSQL bigint)',
+  })
+  before?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(1000)
+  limit?: number;
 }
 
 @Controller('tickets')
@@ -55,17 +80,28 @@ export class TicketsController {
     return { data: result };
   }
 
-  /** Conversation history, ordered; `after` enables cheap incremental refresh. */
+  /**
+   * Conversation history, ordered and cursor-paginated:
+   *   ?after=<id>  — incremental refresh (newer than the cursor)
+   *   ?before=<id> — one older page (for the panel's "load older" button)
+   *   ?limit=1..1000 — page size (default 1000)
+   * The response carries meta.has_more = older messages exist beyond this page.
+   */
   @Get(':id/messages')
   async getMessages(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() query: TicketMessagesQueryDto,
   ) {
+    if (query.after && query.before) {
+      throw new BadRequestException('Pass either after or before, not both');
+    }
     const ticket = await this.ticketsService.findById(id);
     if (!ticket) throw new NotFoundException('Ticket not found');
-    const messages = await this.messagesService.getConversation(id, {
+    const page = await this.messagesService.getConversationPage(id, {
       after: query.after,
+      before: query.before,
+      limit: query.limit,
     });
-    return { data: messages };
+    return { data: page.messages, meta: { has_more: page.has_more } };
   }
 }

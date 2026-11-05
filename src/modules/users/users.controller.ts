@@ -1,4 +1,4 @@
-import { Controller, Get, NotFoundException, Param, Query } from '@nestjs/common';
+import { Controller, Get, NotFoundException, Param, ParseUUIDPipe, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString } from 'class-validator';
 import { UsersService } from './users.service';
@@ -26,7 +26,7 @@ export class UsersController {
   }
 
   @Get(':id')
-  async getUser(@Param('id') id: string) {
+  async getUser(@Param('id', ParseUUIDPipe) id: string) {
     const user = await this.usersService.getUserWithTickets(id);
     if (!user) throw new NotFoundException('User not found');
     return { data: user };
