@@ -8,6 +8,7 @@ import { DataSource, Not, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Ticket } from '../../database/entities/ticket.entity';
 import { Message } from '../../database/entities/message.entity';
+import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { DeliveryStatus, MessageRole, TicketStatus } from '../../database/enums';
 import { EventsService } from '../../common/events/events.service';
 import { isUniqueViolation } from '../../common/utils/pg-errors';
@@ -82,11 +83,16 @@ export class TicketsService {
   /**
    * Status change — one short transaction:
    *   row lock → validations → UPDATE (+closed_at) → INSERT SYSTEM outbox message (PENDING).
-   * The dispatcher (telegram module) sends right after commit; the sweeper is the safety net,
-   * so "status changed ⇒ notification definitely arrives".
+   * The SYSTEM insert happens INSIDE the transaction (transactional-outbox: it
+   * survives any crash), while the in-process events fire only AFTER a
+   * successful commit (review fix #3) so the panel/dispatcher never see a
+   * change that could still roll back. The sweeper remains the safety net.
    *
-   * Rules (plan §6): same status = no-op 200; unknown status = 400; reopening a CLOSED
-   * ticket is allowed only if the user has no other active ticket (409 otherwise).
+   * Rules (plan §6 + review fix #4-a): same status = no-op 200; unknown status
+   * = 400; moving a CLOSED ticket to ANY active status (OPEN or IN_PROGRESS)
+   * is allowed only if the user has no other active ticket — mirroring the
+   * partial unique index exactly, so the answer is a controlled 409 instead
+   * of a leaking 500.
    */
   async changeStatus(
     ticketId: string,
@@ -97,62 +103,85 @@ export class TicketsService {
       throw new BadRequestException(`Invalid ticket status: ${String(newStatus)}`);
     }
 
-    return this.dataSource.transaction(async (manager) => {
-      const ticket = await manager.findOne(Ticket, {
-        where: { id: ticketId },
-        lock: { mode: 'pessimistic_write' },
-      });
-      if (!ticket) throw new NotFoundException('Ticket not found');
+    // Filled inside the transaction, fired after it commits (fix #3).
+    const afterCommit: Array<() => void> = [];
 
-      if (ticket.status === newStatus) {
-        return { ticket, systemMessage: null, changed: false };
-      }
-
-      if (newStatus === TicketStatus.OPEN && ticket.status === TicketStatus.CLOSED) {
-        const otherActive = await manager.findOne(Ticket, {
-          where: { user_id: ticket.user_id, status: Not(TicketStatus.CLOSED) },
+    let result: ChangeStatusResult;
+    try {
+      result = await this.dataSource.transaction(async (manager) => {
+        const ticket = await manager.findOne(Ticket, {
+          where: { id: ticketId },
+          lock: { mode: 'pessimistic_write' },
         });
-        if (otherActive && otherActive.id !== ticket.id) {
-          throw new ConflictException('User already has another active ticket');
+        if (!ticket) throw new NotFoundException('Ticket not found');
+
+        if (ticket.status === newStatus) {
+          return { ticket, systemMessage: null, changed: false };
         }
-      }
 
-      const previousStatus = ticket.status;
-      await manager.update(Ticket, ticket.id, {
-        status: newStatus,
-        closed_at: newStatus === TicketStatus.CLOSED ? new Date() : null,
-        updated_at: new Date(),
+        // ANY transition CLOSED → active status collides with the partial
+        // unique index when the user owns another active ticket (fix #4-a).
+        if (newStatus !== TicketStatus.CLOSED && ticket.status === TicketStatus.CLOSED) {
+          const otherActive = await manager.findOne(Ticket, {
+            where: { user_id: ticket.user_id, status: Not(TicketStatus.CLOSED) },
+          });
+          if (otherActive && otherActive.id !== ticket.id) {
+            throw new ConflictException('User already has another active ticket');
+          }
+        }
+
+        const previousStatus = ticket.status;
+        await manager.update(Ticket, ticket.id, {
+          status: newStatus,
+          closed_at: newStatus === TicketStatus.CLOSED ? new Date() : null,
+          updated_at: new Date(),
+        });
+
+        const content =
+          by === 'USER'
+            ? `تیکت ${ticket.ticket_number} به درخواست شما به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`
+            : `وضعیت تیکت ${ticket.ticket_number} توسط کارشناس پشتیبانی به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`;
+        const msgRepo = manager.getRepository(Message);
+        const systemMessage = await msgRepo.save(
+          msgRepo.create({
+            ticket_id: ticket.id,
+            role: MessageRole.SYSTEM,
+            content,
+            delivery_status: DeliveryStatus.PENDING,
+          }),
+        );
+
+        const updatedTicket: Ticket = {
+          ...ticket,
+          status: newStatus,
+          closed_at: newStatus === TicketStatus.CLOSED ? new Date() : null,
+          updated_at: new Date(),
+        };
+
+        // Deferred until the transaction has actually committed (fix #3).
+        afterCommit.push(() => {
+          this.events.emit('ticket.status_changed', { ticket: updatedTicket, previousStatus, systemMessage });
+          this.events.emit('message.created', { message: systemMessage });
+        });
+
+        return { ticket: updatedTicket, systemMessage, changed: true };
       });
+    } catch (e) {
+      // Race safety net: another ticket became active between the check above
+      // and the UPDATE — the partial unique index rejected us (fix #4-a).
+      if (isUniqueViolation(e)) {
+        throw new ConflictException('User already has another active ticket');
+      }
+      throw e;
+    }
 
-      const content =
-        by === 'USER'
-          ? `تیکت ${ticket.ticket_number} به درخواست شما به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`
-          : `وضعیت تیکت ${ticket.ticket_number} توسط کارشناس پشتیبانی به «${TICKET_STATUS_LABELS[newStatus]}» تغییر کرد.`;
-      const msgRepo = manager.getRepository(Message);
-      const systemMessage = await msgRepo.save(
-        msgRepo.create({
-          ticket_id: ticket.id,
-          role: MessageRole.SYSTEM,
-          content,
-          delivery_status: DeliveryStatus.PENDING,
-        }),
-      );
-
-      const updatedTicket: Ticket = {
-        ...ticket,
-        status: newStatus,
-        closed_at: newStatus === TicketStatus.CLOSED ? new Date() : null,
-        updated_at: new Date(),
-      };
-
-      this.events.emit('ticket.status_changed', { ticket: updatedTicket, previousStatus, systemMessage });
-      this.events.emit('message.created', { message: systemMessage });
-
-      return { ticket: updatedTicket, systemMessage, changed: true };
-    });
+    for (const fire of afterCommit) fire();
+    return result;
   }
 
-  /** Admin list — filter by status, search by number (with/without TKT- prefix), last-activity order. */
+  /** Admin list — filter by status, search by number (with/without TKT- prefix),
+   *  last-activity order, and the OWNER embedded per ticket (review fix: the
+   *  panel shows the user's name, not an internal uuid). */
   async listTickets(params: {
     status?: TicketStatus;
     q?: string;
@@ -160,7 +189,9 @@ export class TicketsService {
     limit: number;
   }): Promise<Paginated<Ticket>> {
     const { status, q, page, limit } = params;
-    const qb = this.repo.createQueryBuilder('t');
+    const qb = this.repo
+      .createQueryBuilder('t')
+      .leftJoinAndMapOne('t.user', TelegramUser, 'u', 'u.id = t.user_id');
 
     if (status) qb.andWhere('t.status = :status', { status });
     if (q) {

@@ -161,5 +161,32 @@ describe('TicketsService', () => {
       );
       expect(manager.update).not.toHaveBeenCalled();
     });
+
+    it('review fix #4-a: CLOSED → IN_PROGRESS with another active ticket is ALSO a 409 (not a 500)', async () => {
+      manager.findOne.mockImplementation(async (_cls, opts) => {
+        const where = (opts as { where: { id?: string } }).where;
+        return where?.id
+          ? mkTicket({ id: 't-1', status: TicketStatus.CLOSED })
+          : mkTicket({ id: 't-OTHER' });
+      });
+
+      await expect(service.changeStatus('t-1', TicketStatus.IN_PROGRESS)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(manager.update).not.toHaveBeenCalled();
+    });
+
+    it('review fix #3: events fire only AFTER the transaction commits', async () => {
+      manager.findOne.mockResolvedValueOnce(mkTicket());
+      // the transaction body runs, but the COMMIT itself fails — the events
+      // queued inside the callback must never be fired
+      dataSource.transaction.mockImplementationOnce(async (cb: (m: unknown) => Promise<unknown>) => {
+        await cb(manager);
+        throw new Error('commit failed');
+      });
+
+      await expect(service.changeStatus('t-1', TicketStatus.CLOSED)).rejects.toThrow('commit failed');
+      expect(events.emit).not.toHaveBeenCalled();
+    });
   });
 });
