@@ -4,6 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { escapeLike, Paginated, toPaginated } from '../../common/pagination';
 import { firstRawRow } from '../../common/utils/raw-rows';
+import { EventsService } from '../../common/events/events.service';
 
 export interface UpsertTelegramUserInput {
   telegram_id: string;
@@ -20,12 +21,18 @@ export type UserWithTicketCount = TelegramUser & { ticket_count: number };
 export class UsersService {
   constructor(
     @InjectRepository(TelegramUser) private readonly repo: Repository<TelegramUser>,
+    private readonly events: EventsService,
   ) {}
 
   /**
    * Single-statement upsert — one row per Telegram user, always refreshed with
    * the latest profile data from the update payload. chat_id defaults to
    * telegram_id for private chats and is stored independently (owner's request).
+   *
+   * `(xmax = 0)` is the standard Postgres trick to learn whether the row was
+   * freshly INSERTed or UPDATEd by the conflict clause — only inserts emit
+   * 'user.created', so the panel's user list refreshes exactly when a new
+   * person writes to the bot (and not on every profile/last_seen refresh).
    */
   async upsertTelegramUser(input: UpsertTelegramUserInput): Promise<TelegramUser> {
     const rows = await this.repo.query(
@@ -40,7 +47,7 @@ export class UsersService {
          language_code  = EXCLUDED.language_code,
          last_seen_at   = now(),
          updated_at     = now()
-       RETURNING *`,
+       RETURNING *, (xmax = 0) AS _was_inserted`,
       [
         input.telegram_id,
         input.chat_id ?? input.telegram_id,
@@ -50,7 +57,11 @@ export class UsersService {
         input.language_code ?? null,
       ],
     );
-    return firstRawRow<TelegramUser>(rows) as TelegramUser;
+    const row = firstRawRow<Record<string, unknown>>(rows);
+    if (row?._was_inserted === true) {
+      this.events.emit('user.created', { user: row as unknown as TelegramUser });
+    }
+    return row as unknown as TelegramUser;
   }
 
   async findByTelegramId(telegram_id: string): Promise<TelegramUser | null> {

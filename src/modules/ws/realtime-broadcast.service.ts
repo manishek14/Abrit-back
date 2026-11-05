@@ -30,6 +30,9 @@ export class RealtimeBroadcastService implements OnModuleInit {
     this.events.on('message.updated', ({ message }) =>
       this.gateway.broadcast('message:updated', { message }),
     );
+    this.events.on('user.created', ({ user }) =>
+      this.gateway.broadcast('user:new', { user }),
+    );
     this.logger.log('domain events → websocket bridge active');
   }
 }

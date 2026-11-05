@@ -2,12 +2,13 @@ import { EventEmitter } from 'node:events';
 import { Injectable, Logger } from '@nestjs/common';
 import { Ticket } from '../../database/entities/ticket.entity';
 import { Message } from '../../database/entities/message.entity';
+import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { TicketStatus } from '../../database/enums';
 
 /**
  * In-process domain events. Used today for the outbox dispatcher (send right
- * after commit) and in Phase 5 by the Socket.IO gateway — one broadcast, any
- * number of listeners, no DB coupling.
+ * after commit) and the Socket.IO gateway — one broadcast, any number of
+ * listeners, no DB coupling.
  */
 export interface DomainEvents {
   'ticket.created': { ticket: Ticket };
@@ -18,6 +19,9 @@ export interface DomainEvents {
   };
   'message.created': { message: Message };
   'message.updated': { message: Message };
+  /** Fires only for FIRST-SEEN users so the panel's user list stays live
+   *  (review fix) without refetching on every profile refresh. */
+  'user.created': { user: TelegramUser };
 }
 
 export type DomainEventName = keyof DomainEvents;
