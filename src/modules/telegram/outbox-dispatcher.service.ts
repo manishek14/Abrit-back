@@ -17,9 +17,12 @@ export function isOutboundPending(m: Message): boolean {
 
 /**
  * Delivers outbox messages to Telegram: immediately after commit (via the
- * message.created event) and again from the sweeper for retries. Semantics are
- * at-least-once: a rare crash between a successful send and the SENT update can
- * duplicate one message (documented limitation, plan §15).
+ * message.created event) and again from the sweeper for retries. Every send
+ * is guarded by an ATOMIC claim (claimForDelivery) with a 60 s lease, so the
+ * immediate path and the sweeper can never deliver the same message twice —
+ * even without a crash. Semantics remain at-least-once only across a hard
+ * crash between a successful Telegram send and the SENT update (documented
+ * limitation, plan §15).
  */
 @Injectable()
 export class OutboxDispatcherService implements OnModuleInit {
@@ -46,49 +49,54 @@ export class OutboxDispatcherService implements OnModuleInit {
   }
 
   async deliver(message: Message): Promise<void> {
-    const ticket = await this.ticketsService.findById(message.ticket_id);
+    // Review fix #2: atomic claim FIRST — exactly one of {immediate dispatcher,
+    // sweeper, stale-lease recovery} owns this send; the losers return quietly.
+    const claimed = await this.messagesService.claimForDelivery(message.id);
+    if (!claimed) return;
+
+    const ticket = await this.ticketsService.findById(claimed.ticket_id);
     if (!ticket) {
-      await this.messagesService.markPermanentlyFailed(message.id, 'ticket no longer exists');
+      await this.messagesService.markPermanentlyFailed(claimed.id, 'ticket no longer exists');
       return;
     }
     const user = await this.usersService.findByIdOrNull(ticket.user_id);
     if (!user) {
-      await this.messagesService.markPermanentlyFailed(message.id, 'ticket user missing');
+      await this.messagesService.markPermanentlyFailed(claimed.id, 'ticket user missing');
       return;
     }
     if (user.is_blocked) {
-      await this.messagesService.markPermanentlyFailed(message.id, 'user blocked the bot');
+      await this.messagesService.markPermanentlyFailed(claimed.id, 'user blocked the bot');
       return;
     }
 
     const chatId = user.chat_id || user.telegram_id;
     try {
       let firstMessageId: string | null = null;
-      for (const chunk of splitForTelegram(message.content)) {
+      for (const chunk of splitForTelegram(claimed.content)) {
         const res = await this.gateway.sendMessage({ chat_id: chatId, text: chunk });
         firstMessageId ??= res.message_id;
       }
-      await this.messagesService.markSent(message.id, firstMessageId);
+      await this.messagesService.markSent(claimed.id, firstMessageId);
     } catch (e) {
       if (e instanceof TelegramApiError) {
         if (e.code === 403) {
           // user blocked the bot — never retry, flag the user (seed users take this path too)
           await this.usersService.setBlocked(user.id, true);
-          await this.messagesService.markPermanentlyFailed(message.id, e.message);
+          await this.messagesService.markPermanentlyFailed(claimed.id, e.message);
           return;
         }
         if (e.permanent) {
-          await this.messagesService.markPermanentlyFailed(message.id, e.message);
+          await this.messagesService.markPermanentlyFailed(claimed.id, e.message);
           return;
         }
         if (e.retryAfterSeconds && e.retryAfterSeconds > 0) {
-          await this.messagesService.deferRetry(message.id, e.retryAfterSeconds);
+          await this.messagesService.deferRetry(claimed.id, e.retryAfterSeconds);
           return;
         }
-        await this.messagesService.markFailed(message.id, e.message);
+        await this.messagesService.markFailed(claimed.id, e.message);
         return;
       }
-      await this.messagesService.markFailed(message.id, (e as Error).message);
+      await this.messagesService.markFailed(claimed.id, (e as Error).message);
     }
   }
 }
