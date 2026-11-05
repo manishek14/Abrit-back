@@ -6,13 +6,56 @@ import { z } from 'zod';
  * OpenRouter credentials are intentionally optional and default to EMPTY — while
  * empty, those integrations stay disabled (per the project owner's instruction)
  * and the rest of the system works normally.
+ *
+ * Review fix (settings & security):
+ *  - known/example JWT secrets are REJECTED (even in development),
+ *  - production additionally demands a 32+ char secret, an explicitly set
+ *    admin password (defaults are refused), and SEED_DEMO_DATA=false,
+ *  - demo seeding stays a development convenience only.
  */
 const boolString = z
   .enum(['true', 'false'])
   .transform((v) => v === 'true');
 
-export const EnvSchema = z
+/** Placeholder/known-weak values that must never boot, in ANY environment. */
+const FORBIDDEN_JWT_SECRETS = new Set([
+  'change-me-to-a-long-random-string-32-chars',
+  'replace-with-a-random-secret-at-least-32-chars',
+  'change-me',
+  'changeme',
+  'secret',
+  'secrets',
+  'jwt-secret',
+  'jwt_secret',
+  'super-secret',
+  'dev-secret',
+  'your-secret',
+  'your-secret-here',
+  'test-secret',
+  'shhh',
+  'shhhhh',
+  '12345678901234567890',
+  'abcdefghijklmnop',
+]);
+
+/** Default/well-known admin passwords refused in production. */
+const FORBIDDEN_ADMIN_PASSWORDS = new Set([
+  'Admin1234!',
+  'admin',
+  'admin123',
+  'admin1234',
+  'password',
+  'password123',
+  '12345678',
+  '123456789',
+  'qwerty123',
+]);
+
+export const RawEnvSchema = z
   .object({
+    // --- runtime environment (drives the production rules below) ---
+    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+
     // --- server ---
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
     CORS_ORIGIN: z.string().default('http://localhost:5173'),
@@ -24,7 +67,11 @@ export const EnvSchema = z
       .min(1, 'required, e.g. postgres://abrit:abrit@127.0.0.1:5432/abrit')
       .refine((v) => /^postgres(ql)?:\/\//.test(v), 'must start with postgres:// — this project uses PostgreSQL'),
     MIGRATIONS_RUN: boolString.default('true'),
-    SEED_DEMO_DATA: boolString.default('true'),
+    // development convenience only — see the production rule in superRefine
+    SEED_DEMO_DATA: boolString.optional(),
+    // review fix (retention): raw Telegram payloads are purged after N days
+    // (conversation messages are kept); 0 disables the purge.
+    BOT_UPDATES_RETENTION_DAYS: z.coerce.number().int().min(0).max(3650).default(30),
 
     // --- auth / first admin ---
     JWT_SECRET: z
@@ -32,7 +79,10 @@ export const EnvSchema = z
       .min(16, 'required and must be at least 16 characters (no default on purpose)'),
     JWT_EXPIRES_IN: z.string().default('8h'),
     ADMIN_EMAIL: z.string().email().default('admin@abrit.local'),
-    ADMIN_PASSWORD: z.string().min(8, 'at least 8 characters').default('Admin1234!'),
+    ADMIN_PASSWORD: z.string()
+      .min(8, 'at least 8 characters')
+      .optional()
+      .or(z.literal('').transform(() => undefined)),
 
     // --- telegram (EMPTY = disabled) ---
     TELEGRAM_MODE: z.enum(['polling', 'webhook']).default('polling'),
@@ -51,6 +101,52 @@ export const EnvSchema = z
     AI_CONTEXT_MAX_CHARS: z.coerce.number().int().min(2000).max(200_000).default(21_000),
   })
   .superRefine((cfg, ctx) => {
+    const isProduction = cfg.NODE_ENV === 'production';
+
+    // --- JWT secret: known/example values never pass, anywhere ---
+    // (underscores and hyphens are treated alike so both placeholder styles die)
+    const normalizedSecret = cfg.JWT_SECRET.trim().toLowerCase().replace(/_/g, '-');
+    if (FORBIDDEN_JWT_SECRETS.has(normalizedSecret)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['JWT_SECRET'],
+        message: 'this is a known/example value — generate a real secret, e.g. `openssl rand -hex 32`',
+      });
+    } else if (isProduction && cfg.JWT_SECRET.length < 32) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['JWT_SECRET'],
+        message: 'must be at least 32 characters in production (e.g. `openssl rand -hex 32`)',
+      });
+    }
+
+    // --- first admin: production requires an explicit, non-default password ---
+    if (isProduction) {
+      const password = cfg.ADMIN_PASSWORD;
+      if (!password) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['ADMIN_PASSWORD'],
+          message: 'must be set explicitly in production (the development default is not allowed)',
+        });
+      } else if (FORBIDDEN_ADMIN_PASSWORDS.has(password) || password.length < 12) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['ADMIN_PASSWORD'],
+          message: 'must be a strong unique value in production (12+ chars, not a known default)',
+        });
+      }
+
+      if (cfg.SEED_DEMO_DATA === true) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['SEED_DEMO_DATA'],
+          message: 'must NOT be enabled in production — set it to false (demo users/tickets must never enter a real database)',
+        });
+      }
+    }
+
+    // --- webhook mode needs its full credential set ---
     if (cfg.TELEGRAM_MODE === 'webhook') {
       if (!cfg.TELEGRAM_BOT_TOKEN) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['TELEGRAM_BOT_TOKEN'], message: 'required when TELEGRAM_MODE=webhook' });
@@ -64,11 +160,16 @@ export const EnvSchema = z
     }
   });
 
-export type Env = z.infer<typeof EnvSchema>;
+/** The final, fully-defaulted environment type consumers see. */
+export type Env = z.infer<typeof RawEnvSchema> & {
+  NODE_ENV: 'development' | 'test' | 'production';
+  SEED_DEMO_DATA: boolean;
+  ADMIN_PASSWORD: string;
+};
 
 /** Validates a raw env record and throws a readable error on failure. */
 export function parseEnv(raw: Record<string, string | undefined>): Env {
-  const parsed = EnvSchema.safeParse(raw);
+  const parsed = RawEnvSchema.safeParse(raw);
   if (!parsed.success) {
     const lines = parsed.error.issues
       .map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`)
@@ -77,7 +178,17 @@ export function parseEnv(raw: Record<string, string | undefined>): Env {
       `Invalid environment configuration:\n${lines}\nHint: copy .env.example to .env and adjust the values.`,
     );
   }
-  return parsed.data;
+
+  const env = parsed.data as Env;
+  // Derived defaults (review fix): demo seeding and the bootstrap admin
+  // password are development conveniences — production must opt in explicitly.
+  if (env.SEED_DEMO_DATA === undefined) {
+    env.SEED_DEMO_DATA = env.NODE_ENV !== 'production';
+  }
+  if (!env.ADMIN_PASSWORD) {
+    env.ADMIN_PASSWORD = 'Admin1234!'; // development/test only — production rejects it above
+  }
+  return env;
 }
 
 /** Parse the merged process.env (ConfigModule injects .env file values before first use). */
