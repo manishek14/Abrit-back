@@ -1,5 +1,5 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn } from 'typeorm';
-import { BotUpdateStatus } from '../enums';
+import { BotUpdateStage, BotUpdateStatus } from '../enums';
 
 /**
  * bot_updates is the Telegram INBOX. The raw update is persisted FIRST
@@ -17,6 +17,15 @@ export class BotUpdate {
 
   @Column({ type: 'enum', enum: BotUpdateStatus, enumName: 'bot_update_status', default: BotUpdateStatus.RECEIVED })
   status: BotUpdateStatus;
+
+  /**
+   * Last completed processing milestone (CLAIMED → USER_SAVED → REPLY_SAVED).
+   * Purely informational for DONE rows; for a stuck PROCESSING row it tells the
+   * operator (and tests) exactly where the previous attempt died, and the
+   * orchestrator resumes from there idempotently.
+   */
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  stage: BotUpdateStage | null;
 
   @Column({ type: 'int', default: 0 })
   attempts: number;

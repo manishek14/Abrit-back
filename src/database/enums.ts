@@ -28,3 +28,14 @@ export enum BotUpdateStatus {
   DONE = 'DONE',
   FAILED = 'FAILED',
 }
+
+/**
+ * Processing milestones inside a single update's run (review fix #1). Stored on
+ * bot_updates.stage; combined with idempotent steps this makes a re-run resume
+ * half-finished work instead of dropping it.
+ */
+export enum BotUpdateStage {
+  CLAIMED = 'CLAIMED',
+  USER_SAVED = 'USER_SAVED',
+  REPLY_SAVED = 'REPLY_SAVED',
+}

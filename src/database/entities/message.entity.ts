@@ -41,6 +41,14 @@ export class Message {
   @Column({ type: 'enum', enum: DeliveryStatus, enumName: 'delivery_status', nullable: true })
   delivery_status: DeliveryStatus | null;
 
+  /**
+   * Delivery lease (review fix #2): set by claimForDelivery's atomic UPDATE; a
+   * concurrent sender loses the claim and skips. A crashed sender's lease
+   * simply expires (now - lease) and the sweeper reclaims.
+   */
+  @Column({ type: 'timestamptz', nullable: true })
+  claimed_at: Date | null;
+
   @Column({ type: 'int', default: 0 })
   delivery_attempts: number;
 
