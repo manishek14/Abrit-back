@@ -1,8 +1,7 @@
 import { ConflictException, Inject, Injectable, Logger } from '@nestjs/common';
 import { BotUpdate } from '../../database/entities/bot-update.entity';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
-import { Message } from '../../database/entities/message.entity';
-import { MessageRole } from '../../database/enums';
+import { BotUpdateStage, MessageRole } from '../../database/enums';
 import { InboxService } from '../inbox/inbox.service';
 import { MessagesService } from '../messages/messages.service';
 import { TicketsService } from '../tickets/tickets.service';
@@ -23,9 +22,15 @@ const MAX_USER_TEXT_LENGTH = 3000;
  * per-chat promise chain, so the second message's AI context always contains the
  * first message's reply. Cross-chat updates run in parallel.
  *
- * Crash semantics: claim() flips the row to PROCESSING; on failure we simply
- * leave it there — the sweeper requeues stale rows (≤ 3 attempts), so every
- * step in here only needs to be idempotent, not transactional-with-network.
+ * Crash semantics (review fix #1 — RESUMABLE processing): every step is
+ * idempotent and the completed milestones are recorded on bot_updates.stage.
+ * On a crash the row stays PROCESSING and the sweeper requeues it; the re-run
+ * then CONTINUES where the previous attempt stopped instead of dropping the
+ * message:
+ *   - addUserMessage returns the previously stored row for this update_id,
+ *   - an already-stored assistant reply short-circuits the AI call,
+ *   - the reply insert is protected by uq_messages_in_reply_to_assistant.
+ * So "user message stored but never answered" can no longer happen.
  */
 @Injectable()
 export class OrchestratorService {
@@ -64,9 +69,17 @@ export class OrchestratorService {
       await this.processUpdate(update);
     } catch (e) {
       // row stays PROCESSING → sweeper requeues after 2 min (≤ 3 attempts)
+      const error = e as Error;
       this.logger.error(
-        `update ${update.update_id} failed processing: ${(e as Error).message} — will be retried by sweeper`,
+        `update ${update.update_id} failed processing: ${error.message} — will be retried by sweeper`,
       );
+      // review fix #4-b: persist the failure reason on the row (status stays
+      // PROCESSING on purpose — the sweeper still owns the retry policy)
+      try {
+        await this.inboxService.recordError(String(update.update_id), error.message);
+      } catch (recordError) {
+        this.logger.warn(`could not record error for update ${update.update_id}`);
+      }
     }
   }
 
@@ -133,7 +146,8 @@ export class OrchestratorService {
       text.slice(0, 60),
     );
     if (created) {
-      // plan §6 rule 1: announce auto-created tickets durably
+      // plan §6 rule 1: announce auto-created tickets durably. `created` is
+      // true exactly once per ticket, so a crash-retry never duplicates it.
       await this.messagesService.addOutboundMessage({
         ticket_id: ticket.id,
         role: MessageRole.SYSTEM,
@@ -141,26 +155,36 @@ export class OrchestratorService {
       });
     }
 
-    let userMessage: Message;
-    try {
-      userMessage = await this.messagesService.addUserMessage({
-        ticket_id: ticket.id,
-        content: text,
-        telegram_update_id: updateId,
-      });
-    } catch (e) {
-      if (e instanceof ConflictException) {
-        // this update's message was already stored before a crash — done, no double reply
-        await this.inboxService.markDone(updateId);
-        return;
-      }
-      throw e;
+    // addUserMessage RESUMES a crashed attempt: when this update already stored
+    // its user message, the existing row is returned and processing continues
+    // with the reply — the message is never left unanswered (review fix #1).
+    const userMessage = await this.messagesService.addUserMessage({
+      ticket_id: ticket.id,
+      content: text,
+      telegram_update_id: updateId,
+    });
+    await this.inboxService.setStage(updateId, BotUpdateStage.USER_SAVED);
+
+    // Rare resume edge: the original attempt stored its message in a ticket
+    // that has since been closed (admin action between crash and requeue) —
+    // the reply must land in the SAME ticket as the user message it answers.
+    const replyTicket =
+      userMessage.ticket_id === ticket.id
+        ? ticket
+        : ((await this.ticketsService.findById(userMessage.ticket_id)) ?? ticket);
+
+    // A previous attempt already stored the assistant reply → done, and no
+    // second AI call (the expensive step) is made.
+    const existingReply = await this.messagesService.findAssistantReply(userMessage.id);
+    if (existingReply) {
+      await this.inboxService.markDone(updateId);
+      return;
     }
 
-    const reply = await this.replyProvider.reply({ ticket, userMessage });
+    const reply = await this.replyProvider.reply({ ticket: replyTicket, userMessage });
     try {
       await this.messagesService.addOutboundMessage({
-        ticket_id: ticket.id,
+        ticket_id: replyTicket.id,
         role: MessageRole.ASSISTANT,
         content: reply.content,
         in_reply_to_id: userMessage.id,
@@ -174,6 +198,7 @@ export class OrchestratorService {
       }
     }
 
+    await this.inboxService.setStage(updateId, BotUpdateStage.REPLY_SAVED);
     await this.inboxService.markDone(updateId);
   }
 }

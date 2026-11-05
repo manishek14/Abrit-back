@@ -11,7 +11,7 @@ import { BotUpdate } from '../../database/entities/bot-update.entity';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { Ticket } from '../../database/entities/ticket.entity';
 import { Message } from '../../database/entities/message.entity';
-import { BotUpdateStatus, MessageRole } from '../../database/enums';
+import { BotUpdateStage, BotUpdateStatus, MessageRole } from '../../database/enums';
 
 const rawUpdate = (messageOver: Record<string, unknown> = {}): Record<string, unknown> => ({
   update_id: 100,
@@ -44,10 +44,14 @@ const mkMessage = (over: Partial<Message> = {}): Message =>
 
 describe('OrchestratorService', () => {
   let service: OrchestratorService;
-  let inbox: { claim: jest.Mock; markDone: jest.Mock };
+  let inbox: { claim: jest.Mock; markDone: jest.Mock; setStage: jest.Mock; recordError: jest.Mock };
   let users: { upsertTelegramUser: jest.Mock };
-  let tickets: { ensureActiveTicket: jest.Mock };
-  let messages: { addUserMessage: jest.Mock; addOutboundMessage: jest.Mock };
+  let tickets: { ensureActiveTicket: jest.Mock; findById: jest.Mock };
+  let messages: {
+    addUserMessage: jest.Mock;
+    addOutboundMessage: jest.Mock;
+    findAssistantReply: jest.Mock;
+  };
   let commands: { handle: jest.Mock };
   let replyProvider: { reply: jest.Mock };
   let gateway: { active: boolean; sendMessage: jest.Mock };
@@ -59,10 +63,10 @@ describe('OrchestratorService', () => {
   };
 
   beforeEach(() => {
-    inbox = { claim: jest.fn(), markDone: jest.fn() };
+    inbox = { claim: jest.fn(), markDone: jest.fn(), setStage: jest.fn(), recordError: jest.fn() };
     users = { upsertTelegramUser: jest.fn() };
-    tickets = { ensureActiveTicket: jest.fn() };
-    messages = { addUserMessage: jest.fn(), addOutboundMessage: jest.fn() };
+    tickets = { ensureActiveTicket: jest.fn(), findById: jest.fn() };
+    messages = { addUserMessage: jest.fn(), addOutboundMessage: jest.fn(), findAssistantReply: jest.fn() };
     commands = { handle: jest.fn() };
     replyProvider = { reply: jest.fn() };
     gateway = { active: true, sendMessage: jest.fn().mockResolvedValue({ message_id: '1' }) };
@@ -71,6 +75,7 @@ describe('OrchestratorService', () => {
     tickets.ensureActiveTicket.mockResolvedValue({ ticket: mkTicket(), created: true });
     messages.addUserMessage.mockResolvedValue(mkMessage());
     messages.addOutboundMessage.mockResolvedValue(mkMessage());
+    messages.findAssistantReply.mockResolvedValue(null);
     replyProvider.reply.mockResolvedValue({ content: 'پاسخ دستیار', meta: null });
 
     service = new OrchestratorService(
@@ -168,16 +173,41 @@ describe('OrchestratorService', () => {
     expect(inbox.markDone).toHaveBeenCalledWith('100');
   });
 
+  it('records the processing milestones on the inbox row (stage tracking)', async () => {
+    await process(rawUpdate());
+    expect(inbox.setStage).toHaveBeenNthCalledWith(1, '100', BotUpdateStage.USER_SAVED);
+    expect(inbox.setStage).toHaveBeenNthCalledWith(2, '100', BotUpdateStage.REPLY_SAVED);
+  });
+
   it('does not announce an existing ticket twice', async () => {
     tickets.ensureActiveTicket.mockResolvedValueOnce({ ticket: mkTicket(), created: false });
     await process(rawUpdate());
     expect(messages.addOutboundMessage).toHaveBeenCalledTimes(1); // assistant reply only
   });
 
-  it('treats a duplicate stored user message (replay) as processed — no AI call', async () => {
-    messages.addUserMessage.mockRejectedValueOnce(new ConflictException('dup'));
+  it('CRASH RESUME (review #1): a previously stored user message still gets its AI reply', async () => {
+    // previous attempt crashed AFTER storing the user message — addUserMessage
+    // returns the existing row instead of throwing
+    const storedBefore = mkMessage({ id: 'm-existing' });
+    messages.addUserMessage.mockResolvedValueOnce(storedBefore);
     await process(rawUpdate());
+
+    // the reply step runs — the user is never left unanswered
+    expect(replyProvider.reply).toHaveBeenCalledTimes(1);
+    expect(messages.addOutboundMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ role: MessageRole.ASSISTANT, in_reply_to_id: 'm-existing' }),
+    );
+    expect(inbox.markDone).toHaveBeenCalledWith('100');
+  });
+
+  it('CRASH RESUME (review #1): reply already stored → done without a second AI call', async () => {
+    // previous attempt crashed AFTER storing the reply but BEFORE markDone
+    messages.addUserMessage.mockResolvedValueOnce(mkMessage({ id: 'm-existing' }));
+    messages.findAssistantReply.mockResolvedValueOnce(mkMessage({ id: 'm-reply' }));
+    await process(rawUpdate());
+
     expect(replyProvider.reply).not.toHaveBeenCalled();
+    expect(messages.addOutboundMessage).toHaveBeenCalledTimes(1); // SYSTEM announcement only
     expect(inbox.markDone).toHaveBeenCalledWith('100');
   });
 
@@ -187,6 +217,13 @@ describe('OrchestratorService', () => {
       .mockImplementationOnce(() => Promise.reject(new ConflictException('dup'))); // reply already exists
     await process(rawUpdate());
     expect(inbox.markDone).toHaveBeenCalledWith('100');
+  });
+
+  it('records the failure reason on the inbox row when processing throws', async () => {
+    replyProvider.reply.mockRejectedValueOnce(new Error('provider exploded'));
+    await process(rawUpdate()); // processSafely swallows the error
+    expect(inbox.recordError).toHaveBeenCalledWith('100', 'provider exploded');
+    expect(inbox.markDone).not.toHaveBeenCalled();
   });
 
   it('processes two updates of the same chat strictly in order', async () => {
