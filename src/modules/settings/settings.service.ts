@@ -24,9 +24,9 @@ export interface ModelListResult {
 
 /** Shown while the OpenRouter key is absent (no network call in that state). */
 export const FALLBACK_MODELS: AssistantModel[] = [
-  { id: 'openrouter/auto', label: 'openrouter/auto (default)' },
+  { id: 'nvidia/nemotron-3-ultra-550b-a55b:free', label: 'nvidia/nemotron-3-ultra-550b-a55b:free (default)' },
+  { id: 'openrouter/auto', label: 'openrouter/auto (paid routing)' },
   { id: 'openai/gpt-4o-mini', label: 'openai/gpt-4o-mini' },
-  { id: 'google/gemini-2.0-flash-001', label: 'google/gemini-2.0-flash-001' },
   { id: 'anthropic/claude-3.5-sonnet', label: 'anthropic/claude-3.5-sonnet' },
   { id: 'meta-llama/llama-3.3-70b-instruct', label: 'meta-llama/llama-3.3-70b-instruct' },
 ];

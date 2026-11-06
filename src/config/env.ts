@@ -143,7 +143,11 @@ export const RawEnvSchema = z
 
     // --- AI / OpenRouter (EMPTY = disabled, fixed fallback reply) ---
     OPENROUTER_API_KEY: z.string().default(''),
-    OPENROUTER_DEFAULT_MODEL: z.string().default('openrouter/auto'),
+    // Real-token smoke test (2026-11-06): openrouter/auto is region-blocked
+    // (403 "not available in your region") for the project owner's key — every
+    // reply would silently fall back. The verified default works with the
+    // owner's free-tier key (good Persian, ~5 s latency, 175+183 tokens).
+    OPENROUTER_DEFAULT_MODEL: z.string().default('nvidia/nemotron-3-ultra-550b-a55b:free'),
     OPENROUTER_TIMEOUT_MS: z.coerce.number().int().min(1000).default(25000),
     AI_CONTEXT_MAX_MESSAGES: z.coerce.number().int().min(2).max(200).default(20),
     AI_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(3),

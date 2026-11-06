@@ -5,6 +5,9 @@ import { IntegrationStateService } from '../../common/integration-state/integrat
 import { RawTelegramUpdate } from './types';
 import { TelegramApiError, TelegramGateway } from './telegram-gateway.interface';
 
+/** The getMe() payload — also telegraf's botInfo shape. */
+type TelegrafBotInfo = Awaited<ReturnType<Telegraf['telegram']['getMe']>>;
+
 /** The getMe() probe is bounded — a black-holed network must not stall the boot. */
 const BOOTSTRAP_PROBE_TIMEOUT_MS = 15_000;
 
@@ -27,6 +30,14 @@ const BOOTSTRAP_PROBE_TIMEOUT_MS = 15_000;
  * probe, reports the lifecycle (starting/ok/degraded) into the shared
  * IntegrationStateService (surfaced by the readiness probe), and in PRODUCTION
  * rethrows so the process refuses to serve a dead bot.
+ *
+ * Real-token smoke-test finding (2026-11-06): telegraf's launch() in POLLING
+ * mode resolves ONLY when the polling loop STOPS (launch → startPolling →
+ * Polling.loop, which `for await`s the long-poll iterator until abort —
+ * telegraf#1344). The awaited launch() therefore froze the whole bootstrap:
+ * with a real token the HTTP server never bound. launch() is now fired
+ * without awaiting; its eventual rejection (401/409 — the loop rethrows
+ * those) is reported as degraded and exits in production.
  */
 export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap, OnModuleDestroy {
   readonly active = true;
@@ -62,10 +73,10 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
       // Prove the token and reachability FIRST — getMe is the cheapest call
       // that fails for exactly the reasons a boot can fail (bad token, no
       // network). Bounded so a black-holed network cannot hang the boot.
-      await this.withBootstrapTimeout(
-        this.bot.telegram.getMe() as Promise<unknown>,
+      const me = (await this.withBootstrapTimeout(
+        this.bot.telegram.getMe() as Promise<TelegrafBotInfo>,
         probeTimeoutMs,
-      );
+      )) as TelegrafBotInfo;
 
       if (this.env.TELEGRAM_MODE === 'webhook') {
         await this.bot.telegram.setWebhook(this.env.TELEGRAM_WEBHOOK_URL, {
@@ -74,9 +85,16 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
         });
         this.logger.log(`Webhook registered: ${this.env.TELEGRAM_WEBHOOK_URL}`);
       } else {
-        // polling mode: clear any leftover webhook, then start long polling
-        await this.bot.telegram.deleteWebhook({ drop_pending_updates: false }).catch(() => undefined);
-        await this.bot.launch({ allowedUpdates: this.allowedUpdates as never });
+        // Polling mode — DO NOT await launch(): it resolves only when polling
+        // STOPS (see the class docstring — the awaited call froze the entire
+        // bootstrap). Fire it and handle the eventual rejection instead.
+        // The probe result becomes botInfo: launch() then skips its own second
+        // (unbounded) getMe and goes straight to polling. launch() itself
+        // clears any leftover webhook before starting the loop.
+        this.bot.botInfo = me;
+        void this.bot.launch({ allowedUpdates: this.allowedUpdates as never }).catch(
+          (e: Error) => this.onPollingCrashed(e),
+        );
         this.logger.log('Polling started (allowed_updates: ' + this.allowedUpdates.join(',') + ')');
       }
       this.integrationState?.setTelegram('ok');
@@ -92,6 +110,20 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
       }
       // Development/test: the API keeps serving (health, panel, tests);
       // outbound messages fail and retry.
+    }
+  }
+
+  /** The polling loop died asynchronously (401 revoked token, 409 second
+   *  polling instance — the only errors the loop rethrows instead of
+   *  retrying). Polling cannot restart itself, so the dead bot is reported
+   * immediately; production exits so the supervisor restarts it — a visible
+   * crash loop beats a silently dead bot (round-6 fail-fast philosophy). */
+  private onPollingCrashed(e: Error): void {
+    const message = e?.message ?? String(e);
+    this.integrationState?.setTelegram('degraded', message);
+    this.logger.error(`Telegram polling crashed: ${message}`);
+    if (this.env.NODE_ENV === 'production') {
+      process.exit(1);
     }
   }
 

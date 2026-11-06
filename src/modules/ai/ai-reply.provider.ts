@@ -43,6 +43,13 @@ export class AiReplyProvider implements ReplyProvider {
     this.semaphore = new Semaphore(getEnv().AI_MAX_CONCURRENCY);
     if (!getEnv().OPENROUTER_API_KEY) {
       this.integrationState.setOpenRouter('disabled');
+    } else {
+      // Real-token smoke-test finding (2026-11-06): with the key CONFIGURED
+      // the status used to stay 'disabled' (the state service's initial
+      // value) until the first reply — misleading in readiness/panel, which
+      // read like the key was missing. 'starting' is the honest label for
+      // "configured, not yet proven by a real request".
+      this.integrationState.setOpenRouter('starting');
     }
   }
 

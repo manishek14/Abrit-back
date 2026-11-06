@@ -71,6 +71,14 @@ describe('AiReplyProvider', () => {
     expect(provider.complete).not.toHaveBeenCalled();
   });
 
+  it('reports openRouter as "starting" (not "disabled") while the key is configured but unproven', () => {
+    // real-token smoke-test regression (2026-11-06): with a configured key the
+    // status used to read 'disabled' until the first reply — readiness/panel
+    // looked like the key was missing
+    makeService();
+    expect(integrationState.snapshot().openRouter.status).toBe('starting');
+  });
+
   it('answers with the fallback message while the API key is empty (zero network calls)', async () => {
     setTestEnv({ OPENROUTER_API_KEY: '' });
     makeService();

@@ -235,3 +235,120 @@ describe('TelegrafGateway (bootstrap degradation)', () => {
   });
 });
 
+/**
+ * Real-token smoke-test regression (2026-11-06, @ABRIT_Ticket_Bot) —
+ * telegraf's launch() in POLLING mode resolves only when the polling loop
+ * STOPS (launch → startPolling → Polling.loop, which `for await`s the
+ * long-poll iterator until abort — telegraf#1344). Awaiting it inside
+ * onApplicationBootstrap therefore NEVER completes: with a real token the
+ * whole bootstrap froze, the HTTP server never bound and health never
+ * answered — invisible to every unit/e2e suite, because they all stub
+ * launch() with a RESOLVING mock or use the fake gateway.
+ */
+describe('TelegrafGateway (real long-polling launch)', () => {
+  /** Env for production-mode tests — production rules demand a 32+ char
+   *  secret, an explicit strong admin password and no demo seeding. */
+  const mkProdEnv = (): Env =>
+    parseEnv({
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgres://abrit@127.0.0.1:5432/abrit',
+      JWT_SECRET: 'prod-secret-0123456789abcdef0123456789abcdef',
+      ADMIN_PASSWORD: 'Prod-Admin-2026!x',
+      SEED_DEMO_DATA: 'false',
+      TELEGRAM_BOT_TOKEN: '123:abc',
+    } as Record<string, string>);
+
+  /** Replaces the whole Telegraf API seam: no network anywhere. */
+  const stubApi = (gateway: TelegrafGateway): void => {
+    (gateway as unknown as { bot: Telegraf }).bot.telegram = {
+      getMe: jest.fn().mockResolvedValue({ id: 1, username: 'abrit_bot' }),
+      setWebhook: jest.fn().mockResolvedValue(undefined),
+      deleteWebhook: jest.fn().mockResolvedValue(undefined),
+      sendMessage: jest.fn(),
+    } as unknown as Telegraf['telegram'];
+  };
+
+  /** A launch() promise shaped like REAL long polling: pending while the
+   *  loop runs, resolved only on stop(), rejected on 401/409. */
+  const realPollingLaunch = (): { promise: Promise<void>; crash: (e: Error) => void } => {
+    let crash: (e: Error) => void = () => undefined;
+    const promise = new Promise<void>((_resolve, reject) => {
+      crash = reject;
+    });
+    return { promise, crash };
+  };
+
+  it('a NEVER-RESOLVING launch (real long polling) must not block the bootstrap', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    stubApi(gateway);
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest
+      .fn()
+      .mockReturnValue(new Promise(() => undefined)); // pending forever, like the real loop
+
+    // the former code awaited launch() → the bootstrap never resolved → the
+    // HTTP server never started. It must resolve and report the bot healthy.
+    await expect(gateway.onApplicationBootstrap(60)).resolves.toBeUndefined();
+    expect(state.snapshot().telegram).toMatchObject({ status: 'ok' });
+  });
+
+  it('an asynchronously REJECTED launch (409: second polling instance) degrades the integration', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    stubApi(gateway);
+    const { promise, crash } = realPollingLaunch();
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest.fn().mockReturnValue(promise);
+
+    await expect(gateway.onApplicationBootstrap(60)).resolves.toBeUndefined();
+    expect(state.snapshot().telegram.status).toBe('ok'); // healthy while polling runs
+
+    crash(new Error('409: Conflict'));
+    await new Promise((r) => setTimeout(r, 10)); // let the catch handler run
+
+    expect(state.snapshot().telegram).toMatchObject({
+      status: 'degraded',
+      detail: expect.stringContaining('409'),
+    });
+  });
+
+  it('PRODUCTION exits when polling crashes asynchronously (token revoked at runtime)', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkProdEnv(), state);
+    stubApi(gateway);
+    const { promise, crash } = realPollingLaunch();
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest.fn().mockReturnValue(promise);
+
+    await expect(gateway.onApplicationBootstrap(60)).resolves.toBeUndefined();
+
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      crash(new Error('401: Unauthorized'));
+      await new Promise((r) => setTimeout(r, 10));
+      // polling is dead and cannot restart itself — refuse to keep serving
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(state.snapshot().telegram).toMatchObject({ status: 'degraded' });
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it('a rejected launch in DEVELOPMENT degrades but keeps serving (no process.exit)', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    stubApi(gateway);
+    const { promise, crash } = realPollingLaunch();
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest.fn().mockReturnValue(promise);
+
+    await gateway.onApplicationBootstrap(60);
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      crash(new Error('401: Unauthorized'));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(state.snapshot().telegram).toMatchObject({ status: 'degraded' });
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+});
+
