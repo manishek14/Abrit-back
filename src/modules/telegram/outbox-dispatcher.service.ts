@@ -20,9 +20,11 @@ export function isOutboundPending(m: Message): boolean {
  * message.created event) and again from the sweeper for retries. Every send
  * is guarded by an ATOMIC claim (claimForDelivery) with a 60 s lease, so the
  * immediate path and the sweeper can never deliver the same message twice —
- * even without a crash. Semantics remain at-least-once only across a hard
- * crash between a successful Telegram send and the SENT update (documented
- * limitation, plan §15).
+ * even without a crash. Multi-part messages record per-chunk progress in
+ * meta (sent_chunks), so a failed/retried send resumes at the first UNSENT
+ * chunk instead of duplicating already-delivered parts. Semantics remain
+ * at-least-once only across a hard crash between a successful Telegram send
+ * of the LAST chunk and the SENT update (documented limitation, plan §15).
  */
 @Injectable()
 export class OutboxDispatcherService implements OnModuleInit {
@@ -70,11 +72,28 @@ export class OutboxDispatcherService implements OnModuleInit {
     }
 
     const chatId = user.chat_id || user.telegram_id;
+    // Multi-part resume (review fix): how many chunks the PREVIOUS attempt
+    // already delivered is committed to meta after each successful send, so a
+    // retry continues at the first UNSENT chunk — already-delivered parts are
+    // never re-sent to the user.
+    const { sentChunks, firstTelegramMessageId: storedFirstId } =
+      MessagesService.readChunkProgress(claimed);
+    const chunks = splitForTelegram(claimed.content);
+
+    // Every chunk was delivered but the process died before markSent — finish
+    // the bookkeeping without a single new Telegram call.
+    if (sentChunks >= chunks.length) {
+      await this.messagesService.markSent(claimed.id, storedFirstId);
+      return;
+    }
+
     try {
-      let firstMessageId: string | null = null;
-      for (const chunk of splitForTelegram(claimed.content)) {
-        const res = await this.gateway.sendMessage({ chat_id: chatId, text: chunk });
-        firstMessageId ??= res.message_id;
+      let firstMessageId: string | null = storedFirstId;
+      for (let i = sentChunks; i < chunks.length; i++) {
+        const res = await this.gateway.sendMessage({ chat_id: chatId, text: chunks[i] });
+        firstMessageId ??= res.message_id; // first chunk's id anchors the reply
+        // durable progress: a crash right after this line resumes at i + 1
+        await this.messagesService.recordChunkSent(claimed.id, i + 1, firstMessageId);
       }
       await this.messagesService.markSent(claimed.id, firstMessageId);
     } catch (e) {

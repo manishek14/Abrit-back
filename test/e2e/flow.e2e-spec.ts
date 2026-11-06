@@ -653,6 +653,7 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     }
 
     // input validation
+    const beforeMessages = await count('messages');
     await authed(
       request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({ content: '' }),
     ).expect(400);
@@ -663,6 +664,15 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
       request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({}),
     ).expect(400);
 
+    // WHITESPACE-ONLY fix: content that is spaces only must be rejected with
+    // 400 at the DTO (trim-before-validate), never stored as an empty message.
+    await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: '     \n\t  ' }),
+    ).expect(400);
+    expect(await count('messages')).toBe(beforeMessages);
+
     // a CLOSED ticket refuses new replies with 409 — reopen first
     await authed(
       request(app.getHttpServer()).patch(`/api/tickets/${ticket.id}/status`).send({ status: 'CLOSED' }),
@@ -670,6 +680,69 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     await authed(
       request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({ content: 'بعد از بستن' }),
     ).expect(409);
+  });
+
+  it('ADMIN REPLY IDEMPOTENCY: a retry with the SAME client_message_id replays the original — never a duplicate send', async () => {
+    await postUpdate(messageUpdate(950801, 'سلام، پیگیری می‌کنم'));
+    await assistantSent(1);
+    const [ticket] = await ds.query(`SELECT id FROM tickets`);
+
+    const first = await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: 'پاسخ یکتا', client_message_id: 'e2e-idem-key-0001' }),
+    ).expect(201);
+    expect(first.body.data).toMatchObject({
+      role: 'ADMIN',
+      content: 'پاسخ یکتا',
+      client_message_id: 'e2e-idem-key-0001',
+    });
+
+    // the operator retried because the first HTTP response was lost
+    const replay = await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: 'پاسخ یکتا', client_message_id: 'e2e-idem-key-0001' }),
+    ).expect(200); // idempotent replay — NOT a new create
+    expect(replay.body.data.id).toBe(first.body.data.id);
+
+    // exactly ONE ADMIN row and exactly ONE Telegram delivery
+    expect(await count('messages', `role = 'ADMIN'`)).toBe(1);
+    await waitFor(async () =>
+      count('messages', `role = 'ADMIN' AND delivery_status = 'SENT'`).then((c) => c === 1),
+    );
+    expect(fakeGateway.sent.filter((s) => s.text === 'پاسخ یکتا')).toHaveLength(1);
+
+    // a malformed idempotency key is rejected up front
+    await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: 'پاسخ', client_message_id: 'short!' }),
+    ).expect(400);
+  });
+
+  it('CURSOR VALIDATION: out-of-bigint-range and zero cursors are 400s, the bigint max is accepted', async () => {
+    const [user] = await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id) VALUES ('950411', '950411') RETURNING *`,
+    );
+    const [ticket] = await ds.query(
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'کرسور معتبر') RETURNING *`,
+      [user.id],
+    );
+    await ds.query(
+      `INSERT INTO messages (ticket_id, role, content) VALUES ($1, 'USER', 'سلام')`,
+      [ticket.id],
+    );
+    const api = `/api/tickets/${ticket.id}/messages`;
+
+    // 19 digits but ABOVE bigint max → 400, not a 500 from the database
+    await authed(request(app.getHttpServer()).get(`${api}?before=9999999999999999999`)).expect(400);
+    await authed(request(app.getHttpServer()).get(`${api}?after=9999999999999999999`)).expect(400);
+    // zero is never a message id cursor
+    await authed(request(app.getHttpServer()).get(`${api}?before=0`)).expect(400);
+    await authed(request(app.getHttpServer()).get(`${api}?after=0`)).expect(400);
+    // the exact bigint boundary is a VALID (empty) page
+    await authed(request(app.getHttpServer()).get(`${api}?after=9223372036854775807`)).expect(200);
   });
 
   it('VALIDATION: /users/:id rejects non-uuid with 400; ticket list embeds the owner', async () => {

@@ -1,46 +1,49 @@
 import {
   BadRequestException,
   Body,
-  ConflictException,
   Controller,
   Get,
+  HttpStatus,
   NotFoundException,
   Param,
-  Patch,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
+  Res,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { IsInt, IsNotEmpty, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
-import { Type } from 'class-transformer';
+import { IsInt, IsNotEmpty, IsOptional, IsString, Matches, Max, MaxLength, Min, Validate } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import type { Response } from 'express';
 import { TicketsService } from './tickets.service';
 import { MessagesService, MAX_PAGE_SIZE } from '../messages/messages.service';
 import { ListTicketsQueryDto } from './dto/list-tickets-query.dto';
 import { UpdateTicketStatusDto } from './dto/update-ticket-status.dto';
 import { CurrentAdmin, CurrentAdminPayload } from '../../common/decorators/current-admin.decorator';
-import { TicketStatus } from '../../database/enums';
+import { IsMessageIdCursorConstraint } from '../../common/validators/message-id-cursor.validator';
 
-/** PostgreSQL bigint identities max out at 2^63-1 → at most 19 digits. */
-export const MESSAGE_ID_CURSOR_REGEX = /^\d{1,19}$/;
-
+/**
+ * Conversation history, ordered and cursor-paginated:
+ *   (no cursor)  — the LATEST `limit` messages (default 50): agents always
+ *                  land on the newest state of the conversation.
+ *   ?after=<id>   — incremental refresh (newer than the cursor)
+ *   ?before=<id>  — one older page (for the panel's "load older" button)
+ *   ?limit=1..1000 — page size (default 50)
+ * meta.has_more reports whether MORE messages exist beyond the page in the
+ * direction of travel (older for initial/before pages, newer for after).
+ */
 export class TicketMessagesQueryDto {
   /** Incremental refresh: return messages newer than this id. */
   @IsOptional()
   @IsString()
-  @MaxLength(19)
-  @Matches(MESSAGE_ID_CURSOR_REGEX, {
-    message: 'after must be a numeric message id (max 19 digits, PostgreSQL bigint)',
-  })
+  @Validate(IsMessageIdCursorConstraint)
   after?: string;
 
   /** Backward pagination: return the `limit` messages older than this id. */
   @IsOptional()
   @IsString()
-  @MaxLength(19)
-  @Matches(MESSAGE_ID_CURSOR_REGEX, {
-    message: 'before must be a numeric message id (max 19 digits, PostgreSQL bigint)',
-  })
+  @Validate(IsMessageIdCursorConstraint)
   before?: string;
 
   @IsOptional()
@@ -54,13 +57,34 @@ export class TicketMessagesQueryDto {
 /** Admin replies are chunked to Telegram's 4096-char hard limit by the dispatcher. */
 const MAX_ADMIN_MESSAGE_LENGTH = 4000;
 
+/** Idempotency keys: url-safe, generated per send attempt by the panel. */
+const CLIENT_MESSAGE_ID_REGEX = /^[A-Za-z0-9_-]{8,64}$/;
+
 export class CreateTicketMessageDto {
-  @IsString()
+  /**
+   * Trimmed BEFORE validation (review fix): whitespace-only drafts ("     ")
+   * must be rejected with 400 here — previously they passed @IsNotEmpty and
+   * were stored as empty strings after the controller's trim().
+   */
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString({ message: 'Message content must be a string' })
   @IsNotEmpty({ message: 'Message content is required' })
   @MaxLength(MAX_ADMIN_MESSAGE_LENGTH, {
     message: `Message content must be at most ${MAX_ADMIN_MESSAGE_LENGTH} characters`,
   })
   content!: string;
+
+  /**
+   * Idempotency key (review fix): the panel generates one per send and REUSES
+   * it on retry, so a lost HTTP response can never produce a duplicated reply
+   * to the user — the server returns the original message instead.
+   */
+  @IsOptional()
+  @IsString()
+  @Matches(CLIENT_MESSAGE_ID_REGEX, {
+    message: 'client_message_id must be 8-64 letters, digits, hyphens or underscores',
+  })
+  client_message_id?: string;
 }
 
 @Controller('tickets')
@@ -96,16 +120,6 @@ export class TicketsController {
     return { data: result };
   }
 
-  /**
-   * Conversation history, ordered and cursor-paginated:
-   *   (no cursor)  — the LATEST `limit` messages (default 50): agents always
-   *                  land on the newest state of the conversation.
-   *   ?after=<id>   — incremental refresh (newer than the cursor)
-   *   ?before=<id>  — one older page (for the panel's "load older" button)
-   *   ?limit=1..1000 — page size (default 50)
-   * meta.has_more reports whether MORE messages exist beyond the page in the
-   * direction of travel (older for initial/before pages, newer for after).
-   */
   @Get(':id/messages')
   async getMessages(
     @Param('id', ParseUUIDPipe) id: string,
@@ -129,23 +143,27 @@ export class TicketsController {
    * admin's id, then the durable outbox delivers it to the user's Telegram
    * chat. The panel's delivery badge follows via realtime message:updated
    * events. Closed tickets refuse new replies with 409 — reopen first.
+   *
+   * Race-safe + idempotent (review fix): the open-ticket check, the lock and
+   * the insert all live in ONE transaction (MessagesService.addAdminMessage)
+   * — this controller deliberately does NOT pre-check the status, because a
+   * read outside the transaction would be the exact race window. A replayed
+   * client_message_id answers with the ORIGINAL message and HTTP 200.
    */
   @Post(':id/messages')
   async postMessage(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateTicketMessageDto,
     @CurrentAdmin() admin: CurrentAdminPayload,
+    @Res({ passthrough: true }) res: Response,
   ) {
-    const ticket = await this.ticketsService.findById(id);
-    if (!ticket) throw new NotFoundException('Ticket not found');
-    if (ticket.status === TicketStatus.CLOSED) {
-      throw new ConflictException('Ticket is closed — reopen it to reply');
-    }
-    const message = await this.messagesService.addAdminMessage({
+    const { message, replayed } = await this.messagesService.addAdminMessage({
       ticket_id: id,
-      content: dto.content.trim(),
+      content: dto.content, // already trimmed by the DTO transform
       admin_id: admin.sub,
+      client_message_id: dto.client_message_id ?? null,
     });
+    if (replayed) res.status(HttpStatus.OK); // idempotent replay — not a new create
     return { data: message };
   }
 }

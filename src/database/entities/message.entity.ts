@@ -58,6 +58,16 @@ export class Message {
   @Column({ type: 'bigint', nullable: true })
   telegram_message_id: string | null;
 
+  /**
+   * Operator-reply idempotency key (review fix): the panel generates one per
+   * send attempt; a retry after a lost HTTP response re-uses the SAME key so
+   * the partial unique index (migration) turns the duplicate INSERT into a
+   * replay of the original message instead of a second Telegram delivery.
+   */
+  @Index('uq_messages_client_message_id', { unique: true, where: `role = 'ADMIN'` })
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  client_message_id: string | null;
+
   @Column({ type: 'uuid', nullable: true })
   admin_id: string | null;
 

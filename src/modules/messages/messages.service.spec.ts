@@ -1,10 +1,10 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { DataSource, Repository } from 'typeorm';
 import { MessagesService, INITIAL_PAGE_SIZE } from './messages.service';
 import { EventsService } from '../../common/events/events.service';
 import { Message } from '../../database/entities/message.entity';
 import { Ticket } from '../../database/entities/ticket.entity';
-import { DeliveryStatus, MessageRole } from '../../database/enums';
+import { DeliveryStatus, MessageRole, TicketStatus } from '../../database/enums';
 
 const mkMessage = (over: Partial<Message> = {}): Message =>
   ({
@@ -14,6 +14,7 @@ const mkMessage = (over: Partial<Message> = {}): Message =>
     content: 'سلام',
     telegram_update_id: null,
     in_reply_to_id: null,
+    client_message_id: null,
     delivery_status: null,
     delivery_attempts: 0,
     error: null,
@@ -24,6 +25,9 @@ const mkMessage = (over: Partial<Message> = {}): Message =>
     sent_at: null,
     ...over,
   }) as Message;
+
+const mkTicket = (over: Partial<Ticket> = {}): Ticket =>
+  ({ id: 't-1', status: TicketStatus.OPEN, ...over }) as Ticket;
 
 describe('MessagesService', () => {
   let service: MessagesService;
@@ -39,7 +43,7 @@ describe('MessagesService', () => {
   };
   let events: { emit: jest.Mock };
   /** Transactional manager handed to persistWithTouch by the mocked DataSource. */
-  let manager: { create: jest.Mock; save: jest.Mock; update: jest.Mock };
+  let manager: { create: jest.Mock; save: jest.Mock; update: jest.Mock; findOne: jest.Mock };
   let dataSource: { getRepository: jest.Mock; transaction: jest.Mock };
 
   beforeEach(() => {
@@ -58,6 +62,7 @@ describe('MessagesService', () => {
       create: jest.fn((entity, x) => x),
       save: jest.fn(),
       update: jest.fn(),
+      findOne: jest.fn().mockResolvedValue(mkTicket()),
     };
     dataSource = {
       getRepository: jest.fn().mockReturnValue({ update: jest.fn() }),
@@ -198,6 +203,12 @@ describe('MessagesService', () => {
         admin_id: 'a-1',
       });
 
+      // Race-safe contract: the transaction locks the ticket row BEFORE the
+      // insert — the SAME pessimistic_write lock changeStatus takes.
+      expect(manager.findOne).toHaveBeenCalledWith(
+        Ticket,
+        { where: { id: 't-1' }, lock: { mode: 'pessimistic_write' } },
+      );
       expect(manager.save).toHaveBeenCalledWith(
         Message,
         expect.objectContaining({
@@ -205,12 +216,111 @@ describe('MessagesService', () => {
           role: MessageRole.ADMIN,
           content: 'پاسخ کارشناس',
           admin_id: 'a-1',
+          client_message_id: null,
           delivery_status: DeliveryStatus.PENDING,
         }),
       );
       expect(manager.update).toHaveBeenCalledWith(Ticket, 't-1', { last_message_at: expect.any(Date) });
       expect(events.emit).toHaveBeenCalledWith('message.created', { message: stored });
-      expect(result.id).toBe('m-admin');
+      expect(result.message.id).toBe('m-admin');
+      expect(result.replayed).toBe(false);
+    });
+
+    it('RACE FIX: rejects with 409 when the ticket is CLOSED inside the transaction — no insert', async () => {
+      manager.findOne.mockResolvedValueOnce(mkTicket({ status: TicketStatus.CLOSED }));
+
+      await expect(
+        service.addAdminMessage({ ticket_id: 't-1', content: 'پاسخ', admin_id: 'a-1' }),
+      ).rejects.toThrow(ConflictException);
+
+      expect(manager.save).not.toHaveBeenCalled(); // nothing was stored
+      expect(events.emit).not.toHaveBeenCalled(); // and no event fired
+    });
+
+    it('RACE FIX: unknown ticket inside the transaction → 404, no insert', async () => {
+      manager.findOne.mockResolvedValueOnce(null);
+
+      await expect(
+        service.addAdminMessage({ ticket_id: 't-404', content: 'پاسخ', admin_id: 'a-1' }),
+      ).rejects.toThrow(NotFoundException);
+
+      expect(manager.save).not.toHaveBeenCalled();
+    });
+
+    it('IDEMPOTENCY: a known client_message_id replays the ORIGINAL row — nothing stored, no double event chain', async () => {
+      const original = mkMessage({
+        id: 'm-first',
+        role: MessageRole.ADMIN,
+        admin_id: 'a-1',
+        client_message_id: 'key-12345678',
+        delivery_status: DeliveryStatus.PENDING,
+      });
+      repo.findOne.mockResolvedValueOnce(original);
+
+      const result = await service.addAdminMessage({
+        ticket_id: 't-1',
+        content: 'پاسخ تکراری',
+        admin_id: 'a-1',
+        client_message_id: 'key-12345678',
+      });
+
+      expect(result.message).toBe(original); // the FIRST message comes back
+      expect(result.replayed).toBe(true);
+      expect(manager.save).not.toHaveBeenCalled(); // nothing new was stored
+      // the replay re-fires message.created (heals a crash-between-commit-and-
+      // emit; the panel merges by id and the atomic claim prevents a re-send)
+      expect(events.emit).toHaveBeenCalledWith('message.created', { message: original });
+    });
+
+    it('IDEMPOTENCY: loses a concurrent same-key race → the winner’s message is returned', async () => {
+      const winner = mkMessage({
+        id: 'm-winner',
+        role: MessageRole.ADMIN,
+        client_message_id: 'key-12345678',
+      });
+      repo.findOne // pre-check misses
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(winner); // race loser re-read finds the winner
+      manager.save.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: '23505' }));
+
+      const result = await service.addAdminMessage({
+        ticket_id: 't-1',
+        content: 'پاسخ',
+        admin_id: 'a-1',
+        client_message_id: 'key-12345678',
+      });
+
+      expect(result.message).toBe(winner);
+      expect(result.replayed).toBe(true);
+    });
+  });
+
+  describe('multi-chunk delivery progress (review fix — no duplicated parts)', () => {
+    it('recordChunkSent atomically merges sent_chunks + the first chunk id into meta', async () => {
+      repo.query.mockResolvedValueOnce([]);
+
+      await service.recordChunkSent('m-1', 2, '77');
+
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain("'sent_chunks'");
+      expect(sql).toContain("'first_telegram_message_id'");
+      expect(sql).toContain('COALESCE($3::text, meta'); // merge, not overwrite
+      expect(params).toEqual(['m-1', 2, '77']);
+    });
+
+    it('readChunkProgress tolerates missing/invalid meta and keeps the stored first id', () => {
+      expect(MessagesService.readChunkProgress(mkMessage())).toEqual({
+        sentChunks: 0,
+        firstTelegramMessageId: null,
+      });
+      expect(
+        MessagesService.readChunkProgress(
+          mkMessage({ meta: { sent_chunks: 1, first_telegram_message_id: '77', model: 'x' } }),
+        ),
+      ).toEqual({ sentChunks: 1, firstTelegramMessageId: '77' });
+      expect(
+        MessagesService.readChunkProgress(mkMessage({ meta: { sent_chunks: -3 } })),
+      ).toEqual({ sentChunks: 0, firstTelegramMessageId: null });
     });
   });
 

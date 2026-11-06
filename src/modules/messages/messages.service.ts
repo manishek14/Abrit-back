@@ -1,12 +1,19 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource, EntityManager, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Message } from '../../database/entities/message.entity';
 import { Ticket } from '../../database/entities/ticket.entity';
-import { DeliveryStatus, MessageRole } from '../../database/enums';
+import { DeliveryStatus, MessageRole, TicketStatus } from '../../database/enums';
 import { EventsService } from '../../common/events/events.service';
 import { isUniqueViolation } from '../../common/utils/pg-errors';
 import { firstRawRow } from '../../common/utils/raw-rows';
+
+export interface AddAdminMessageResult {
+  message: Message;
+  /** true = the client_message_id already existed: the ORIGINAL message is
+   *  returned unchanged (idempotent replay), nothing new was stored. */
+  replayed: boolean;
+}
 
 /** Send attempts per outbound message (immediate + sweeper retries, backoff respected). */
 export const MAX_DELIVERY_ATTEMPTS = 5;
@@ -53,12 +60,28 @@ export class MessagesService {
    *      back (they would otherwise deliver a phantom message);
    *   3. every creation route is idempotent (unique dedup + resume), so the
    *      sweeper can always finish half-done work.
+   *
+   * With `requireOpenTicket` the transaction FIRST locks the ticket row with
+   * the SAME pessimistic_write lock `TicketsService.changeStatus` takes, then
+   * checks the status and inserts — so a concurrent close can never slip
+   * between the check and the store (review fix: closed-ticket race).
    */
   private async persistWithTouch(
     create: (manager: EntityManager) => Promise<Message>,
     ticketId: string,
+    opts: { requireOpenTicket?: boolean } = {},
   ): Promise<Message> {
     const saved = await this.dataSource.transaction(async (manager) => {
+      if (opts.requireOpenTicket) {
+        const ticket = await manager.findOne(Ticket, {
+          where: { id: ticketId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (!ticket) throw new NotFoundException('Ticket not found');
+        if (ticket.status === TicketStatus.CLOSED) {
+          throw new ConflictException('Ticket is closed — reopen it to reply');
+        }
+      }
       const message = await create(manager);
       await manager.update(Ticket, ticketId, { last_message_at: new Date() });
       return message;
@@ -159,26 +182,73 @@ export class MessagesService {
    * row with admin_id recorded; the dispatcher delivers it to Telegram exactly
    * like assistant replies and `message.updated` events flip the panel's
    * delivery badge to SENT/FAILED in realtime.
+   *
+   * Race-safe (review fix): the open-ticket check and the insert share ONE
+   * transaction holding the ticket row lock — a concurrent `changeStatus` to
+   * CLOSED blocks on the same lock, so no reply can ever land in a closed
+   * ticket, and no close can interleave between check and store.
+   *
+   * IDEMPOTENT (review fix): when `client_message_id` is supplied, a replay
+   * (the operator retried because the first HTTP response was lost) returns
+   * the original row — the panel-generated key is protected by a partial
+   * unique index, so a duplicate reply can never reach the user twice.
+   * The replay also re-fires `message.created`: if the first attempt died
+   * right after commit, this heals both the panel merge and the immediate
+   * delivery (the atomic claim keeps a double Telegram send impossible).
    */
   async addAdminMessage(input: {
     ticket_id: string;
     content: string;
     admin_id: string;
-  }): Promise<Message> {
-    return this.persistWithTouch(
-      (manager) =>
-        manager.save(
-          Message,
-          manager.create(Message, {
-            ticket_id: input.ticket_id,
-            role: MessageRole.ADMIN,
-            content: input.content,
-            admin_id: input.admin_id,
-            delivery_status: DeliveryStatus.PENDING,
-          }),
-        ),
-      input.ticket_id,
-    );
+    client_message_id?: string | null;
+  }): Promise<AddAdminMessageResult> {
+    // Fast replay path — checked BEFORE the transaction so a retry is answered
+    // even if the ticket was closed after the original send (the reply is
+    // already stored and being delivered; the operator should see that).
+    if (input.client_message_id) {
+      const existing = await this.findAdminByClientId(input.client_message_id);
+      if (existing) {
+        this.events.emit('message.created', { message: existing });
+        return { message: existing, replayed: true };
+      }
+    }
+
+    try {
+      const message = await this.persistWithTouch(
+        (manager) =>
+          manager.save(
+            Message,
+            manager.create(Message, {
+              ticket_id: input.ticket_id,
+              role: MessageRole.ADMIN,
+              content: input.content,
+              admin_id: input.admin_id,
+              client_message_id: input.client_message_id ?? null,
+              delivery_status: DeliveryStatus.PENDING,
+            }),
+          ),
+        input.ticket_id,
+        { requireOpenTicket: true },
+      );
+      return { message, replayed: false };
+    } catch (e) {
+      // Lost the concurrent replay race: the other request with the same
+      // client_message_id committed first → return THEIR message.
+      if (isUniqueViolation(e) && input.client_message_id) {
+        const existing = await this.findAdminByClientId(input.client_message_id);
+        if (existing) {
+          this.events.emit('message.created', { message: existing });
+          return { message: existing, replayed: true };
+        }
+      }
+      throw e;
+    }
+  }
+
+  private async findAdminByClientId(clientMessageId: string): Promise<Message | null> {
+    return this.repo.findOne({
+      where: { client_message_id: clientMessageId, role: MessageRole.ADMIN },
+    });
   }
 
   /**
@@ -364,6 +434,44 @@ export class MessagesService {
     );
     const updated = await this.repo.findOneByOrFail({ id: messageId });
     this.events.emit('message.updated', { message: updated });
+  }
+
+  /**
+   * Durable per-chunk progress for multi-part messages (review fix): after
+   * EVERY successfully delivered chunk the count is committed, so a retry
+   * (sweeper or crash recovery) resumes at the first UNSSENT chunk instead of
+   * re-sending already-delivered parts to the user. The first chunk's Telegram
+   * message id is kept as the conversation anchor. Atomic jsonb merge — other
+   * meta keys (model, retry_after_until…) are preserved.
+   */
+  async recordChunkSent(
+    messageId: string,
+    sentChunks: number,
+    firstTelegramMessageId: string | null,
+  ): Promise<void> {
+    await this.repo.query(
+      `UPDATE messages
+          SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                'sent_chunks', $2::int,
+                'first_telegram_message_id', COALESCE($3::text, meta->>'first_telegram_message_id')
+              )
+        WHERE id = $1`,
+      [messageId, sentChunks, firstTelegramMessageId],
+    );
+  }
+
+  /**
+   * Multi-part progress carried on the row (review fix): how many chunks were
+   * already delivered, and the Telegram message id of the first chunk.
+   */
+  static readChunkProgress(message: Message): { sentChunks: number; firstTelegramMessageId: string | null } {
+    const meta = (message.meta ?? {}) as Record<string, unknown>;
+    const sentChunks = typeof meta.sent_chunks === 'number' && meta.sent_chunks >= 0
+      ? meta.sent_chunks
+      : 0;
+    const firstTelegramMessageId =
+      typeof meta.first_telegram_message_id === 'string' ? meta.first_telegram_message_id : null;
+    return { sentChunks, firstTelegramMessageId };
   }
 
   private async touchTicket(ticket_id: string): Promise<void> {

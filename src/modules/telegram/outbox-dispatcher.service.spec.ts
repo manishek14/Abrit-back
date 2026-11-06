@@ -42,6 +42,7 @@ describe('OutboxDispatcherService', () => {
     markFailed: jest.Mock;
     markPermanentlyFailed: jest.Mock;
     deferRetry: jest.Mock;
+    recordChunkSent: jest.Mock;
   };
   let tickets: { findById: jest.Mock };
   let users: { findByIdOrNull: jest.Mock; setBlocked: jest.Mock };
@@ -55,6 +56,7 @@ describe('OutboxDispatcherService', () => {
       markFailed: jest.fn(),
       markPermanentlyFailed: jest.fn(),
       deferRetry: jest.fn(),
+      recordChunkSent: jest.fn(),
     };
     tickets = { findById: jest.fn() };
     users = { findByIdOrNull: jest.fn(), setBlocked: jest.fn() };
@@ -130,6 +132,88 @@ describe('OutboxDispatcherService', () => {
     handler({ message: mkMessage({ delivery_status: DeliveryStatus.SENT }) }); // already sent → skip
 
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  describe('multi-part resume (review fix — no duplicated chunks after a failure)', () => {
+    const longText = `${'x'.repeat(2000)}\n${'y'.repeat(2000)}\n${'z'.repeat(2000)}`;
+    // three 2000-char parts separated by newlines → 3 chunks (newline cuts)
+    const chunks = () => splitForTelegram(longText);
+
+    it('records durable progress after EVERY chunk and keeps the first chunk’s id', async () => {
+      expect(chunks().length).toBe(3);
+      messages.claimForDelivery.mockResolvedValueOnce(mkMessage({ id: 'm-long', content: longText }));
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+      gateway.sendMessage
+        .mockResolvedValueOnce({ message_id: '77' })
+        .mockResolvedValueOnce({ message_id: '78' })
+        .mockResolvedValueOnce({ message_id: '79' });
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      expect(gateway.sendMessage).toHaveBeenCalledTimes(3);
+      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(1, 'm-long', 1, '77');
+      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(2, 'm-long', 2, '77');
+      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(3, 'm-long', 3, '77');
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77'); // first chunk anchors the reply
+    });
+
+    it('chunk 2 fails → progress (1) is kept; the retry sends ONLY chunks 2 and 3', async () => {
+      // FIRST attempt: chunk 1 delivered, chunk 2 throws
+      messages.claimForDelivery.mockResolvedValueOnce(mkMessage({ id: 'm-long', content: longText }));
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+      gateway.sendMessage
+        .mockResolvedValueOnce({ message_id: '77' })
+        .mockRejectedValueOnce(new Error('network down'));
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      expect(messages.recordChunkSent).toHaveBeenCalledWith('m-long', 1, '77'); // progress persisted
+      expect(messages.markFailed).toHaveBeenCalledWith('m-long', 'network down');
+      expect(messages.markSent).not.toHaveBeenCalled();
+
+      // RETRY (sweeper): the claimed row carries meta.sent_chunks = 1 → resume
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({
+          id: 'm-long',
+          content: longText,
+          meta: { sent_chunks: 1, first_telegram_message_id: '77' },
+        }),
+      );
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+      gateway.sendMessage.mockClear();
+      gateway.sendMessage
+        .mockResolvedValueOnce({ message_id: '78' })
+        .mockResolvedValueOnce({ message_id: '79' });
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      // chunk 1 was NOT re-sent — exactly two sends, starting at chunk 2
+      expect(gateway.sendMessage).toHaveBeenCalledTimes(2);
+      expect(gateway.sendMessage).toHaveBeenNthCalledWith(1, { chat_id: '555', text: chunks()[1] });
+      expect(gateway.sendMessage).toHaveBeenNthCalledWith(2, { chat_id: '555', text: chunks()[2] });
+      expect(messages.recordChunkSent).toHaveBeenLastCalledWith('m-long', 3, '77');
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77'); // stored first id survives
+    });
+
+    it('every chunk already delivered but markSent crashed → finish bookkeeping WITHOUT any Telegram call', async () => {
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({
+          id: 'm-long',
+          content: longText,
+          meta: { sent_chunks: 3, first_telegram_message_id: '77' },
+        }),
+      );
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      expect(gateway.sendMessage).not.toHaveBeenCalled(); // nothing re-sent
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77');
+    });
   });
 
   describe('splitForTelegram', () => {
