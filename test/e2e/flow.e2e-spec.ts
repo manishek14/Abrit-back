@@ -7,7 +7,7 @@ import { OutboxDispatcherService } from '../../src/modules/telegram/outbox-dispa
 import { MessagesService } from '../../src/modules/messages/messages.service';
 import { TelegramApiError } from '../../src/modules/telegram/telegram-gateway.interface';
 import { InboxRetentionService } from '../../src/modules/inbox/inbox-retention.service';
-import { AI_INACTIVE_MESSAGE } from '../../src/common/ticket-labels';
+import { AI_FALLBACK_MESSAGE } from '../../src/common/ticket-labels';
 import { FakeTelegramGateway } from '../fakes/telegram-gateway.fake';
 import { createTestApp } from '../testing/app-builder';
 
@@ -51,7 +51,7 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
 
   const countAsync = (table: string, where: string) => count(table, where);
 
-  async function waitFor(predicate: () => Promise<boolean>, ms = 4000): Promise<void> {
+  async function waitFor(predicate: () => boolean | Promise<boolean>, ms = 4000): Promise<void> {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
       if (await predicate()) return;
@@ -65,6 +65,50 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   );
 
   const authed = (req: request.Test) => req.set('Authorization', `Bearer ${token}`);
+
+  /* ------------------------------------------------------------------ */
+  /* Feature-round helpers: registration + the staged ticket wizard      */
+  /* The waits filter by chat_id so PARALLEL users never consume each    */
+  /* other's evidence; helpers never clear the shared record — tests do. */
+  /* ------------------------------------------------------------------ */
+
+  const sentFor = (tgId: number, needle: string) =>
+    fakeGateway.sent.some((s) => s.chat_id === String(tgId) && s.text.includes(needle));
+
+  /** Drives a user through /start → name → phone until the profile completes. */
+  async function register(tgId: number): Promise<void> {
+    await postUpdate(messageUpdate(tgId, '/start'));
+    await waitFor(() => sentFor(tgId, 'خوش آمدید'));
+
+    await postUpdate(messageUpdate(tgId, 'کاربر آزمون'));
+    await waitFor(() => sentFor(tgId, 'شماره همراه'));
+
+    await postUpdate(messageUpdate(tgId, '09121234567'));
+    await waitFor(() => sentFor(tgId, 'پروفایل شما تکمیل شد'));
+  }
+
+  /** Drives the wizard: 🎫 → title → department → description → confirmation. */
+  async function createTicketViaWizard(
+    tgId: number,
+    title: string,
+    department: string,
+    description: string,
+  ): Promise<void> {
+    await postUpdate(messageUpdate(tgId, '🎫 ثبت تیکت جدید'));
+    await waitFor(() => sentFor(tgId, 'عنوان تیکت'));
+
+    await postUpdate(messageUpdate(tgId, title));
+    await waitFor(() => sentFor(tgId, 'دپارتمان'));
+
+    await postUpdate(messageUpdate(tgId, department));
+    await waitFor(() => sentFor(tgId, 'متن درخواست'));
+
+    await postUpdate(messageUpdate(tgId, description));
+    await waitFor(() => sentFor(tgId, 'تیکت شما با موفقیت ثبت شد'));
+  }
+
+  /** Waits for the bot to have sent at least n ephemeral messages. */
+  const botSent = (n: number) => waitFor(() => fakeGateway.sent.length >= n);
 
   beforeAll(async () => {
     const built = await createTestApp();
@@ -101,70 +145,109 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
       .expect(403);
   });
 
-  it('scenario 1/9: duplicate updates (even concurrent) create exactly one user, one ticket, one reply', async () => {
-    const update = messageUpdate(910001, 'سلام، مشکل پرداخت دارم');
-    await postUpdate(update);
-    await postUpdate(update);
-    await Promise.all([postUpdate(update), postUpdate(update), postUpdate(update)]);
+  it('scenario 1/9: duplicate updates of the wizard FINALIZE (even concurrent) create exactly one user, one ticket, one description', async () => {
+    await register(910001);
+    await postUpdate(messageUpdate(910001, '🎫 ثبت تیکت جدید'));
+    await postUpdate(messageUpdate(910001, 'مشکل پرداخت'));
+    await postUpdate(messageUpdate(910001, '💰 مالی'));
 
-    await assistantSent(1);
+    const finalize = messageUpdate(910001, 'درگاه پرداخت خطا می‌دهد و مبلغ کسر شده است');
+    await postUpdate(finalize);
+    await postUpdate(finalize);
+    await Promise.all([postUpdate(finalize), postUpdate(finalize), postUpdate(finalize)]);
+
+    // exactly ONE ticket with ONE stored description — the idempotency walls hold
+    await waitFor(async () => (await count('tickets')) === 1);
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('تیکت شما با موفقیت ثبت شد')));
 
     expect(await count('telegram_users')).toBe(1);
     expect(await count('tickets')).toBe(1);
     expect(await count('messages', `role = 'USER'`)).toBe(1);
+    expect(await count('messages', `role = 'SYSTEM'`)).toBe(1); // the durable announcement
     const inbox = await ds.query('SELECT status, attempts FROM bot_updates');
-    expect(inbox).toHaveLength(1);
-    expect(inbox[0].status).toBe('DONE');
+    expect(inbox).toHaveLength(7); // /start + name + phone + menu + title + dept + finalize (dupes deduped)
+    expect(inbox.every((r: { status: string }) => r.status === 'DONE')).toBe(true);
     expect(Number(inbox[0].attempts)).toBe(1);
   });
 
-  it('scenario 2/4: message without an active ticket → TKT-number ticket, subject, announcement, fallback reply delivered', async () => {
+  it('scenario 2/4: a REGISTERED user\'s plain text goes to the AI chat (NO auto-ticket); the wizard is the ONLY ticket path', async () => {
+    await register(910002);
+    fakeGateway.sent = [];
     await postUpdate(messageUpdate(910002, 'درگاه پرداخت خطا می‌دهد'));
 
-    await assistantSent(1);
+    // the AI key is intentionally empty in e2e → the honest fallback, ephemerally
+    await botSent(1);
+    const reply = fakeGateway.sent[0];
+    expect(reply.text).toContain('پیام شما ثبت شد'); // honest fallback (AI key empty)
+    expect(reply.chat_id).toBe('910002');
+
+    // NO ticket, NO messages row — general conversations are not tickets
+    expect(await count('tickets')).toBe(0);
+    expect(await count('messages')).toBe(0);
+
+    // the wizard path works: title → department keyboard → description → confirmation
+    await postUpdate(messageUpdate(910002, '🎫 ثبت تیکت جدید'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('عنوان تیکت')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(910002, 'درگاه پرداخت خطا می‌دهد'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('دپارتمان')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(910002, '💰 مالی'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('متن درخواست')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(910002, 'مبلغ دو بار کسر شده است'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('تیکت شما با موفقیت ثبت شد')));
 
     const [ticket] = await ds.query('SELECT * FROM tickets');
     expect(ticket.ticket_number).toMatch(/^TKT-\d+$/);
     expect(ticket.status).toBe('OPEN');
     expect(ticket.subject).toBe('درگاه پرداخت خطا می‌دهد');
+    expect(ticket.department).toBe('FINANCE');
 
     const roles = (await ds.query('SELECT role FROM messages ORDER BY id')).map(
       (r: { role: string }) => r.role,
     );
-    expect(roles).toEqual(['SYSTEM', 'USER', 'ASSISTANT']);
-
-    const [reply] = await ds.query(`SELECT content, delivery_status, meta FROM messages WHERE role = 'ASSISTANT'`);
-    expect(reply.delivery_status).toBe('SENT');
-    expect(reply.content).toContain('ثبت شد'); // honest fallback (AI key intentionally empty)
-    // the fake gateway delivered both announcement and reply
-    expect(fakeGateway.sent.length).toBe(2);
+    expect(roles).toEqual(['USER', 'SYSTEM']); // description + durable announcement — NO ASSISTANT row in the wizard
+    expect(fakeGateway.sent.some((s) => s.text.includes('۱۴۰۵/'))).toBe(true); // Jalali date present
   });
 
-  it('scenario 3 (concurrency): 20 users in parallel → 20 distinct ticket numbers', async () => {
+  it('scenario 3 (concurrency): 20 users in parallel through registration + wizard → 20 distinct ticket numbers', async () => {
     await Promise.all(
       Array.from({ length: 20 }, (_, i) =>
-        postUpdate(messageUpdate(911_000 + i, `مشکل شماره ${i + 1}`)),
+        (async () => {
+          const tgId = 911_000 + i;
+          await register(tgId);
+          await createTicketViaWizard(
+            tgId,
+            `مشکل شماره ${i + 1}`,
+            '⚙️ فنی',
+            `توضیحات کامل مشکل شماره ${i + 1} برای تست همزمانی`,
+          );
+        })(),
       ),
     );
 
     await waitFor(async () => (await count('tickets')) === 20);
-    await assistantSent(20);
 
-    const rows = await ds.query('SELECT ticket_number FROM tickets');
+    const rows = await ds.query('SELECT ticket_number, department FROM tickets');
     const numbers = rows.map((r: { ticket_number: string }) => r.ticket_number);
     expect(new Set(numbers).size).toBe(20);
     for (const n of numbers) expect(n).toMatch(/^TKT-\d+$/);
+    expect(rows.every((r: { department: string }) => r.department === 'TECHNICAL')).toBe(true);
   });
 
-  it('scenario 12/13: closed ticket ⇒ next message opens a FRESH ticket; one active per user otherwise', async () => {
-    await postUpdate(messageUpdate(910003, 'پیام اول'));
-    await assistantSent(1);
-
-    // second message continues in the SAME ticket
-    await postUpdate(messageUpdate(910003, 'پیام دوم'));
-    await assistantSent(2);
+  it('scenario 12/13: closed ticket ⇒ the wizard opens a FRESH ticket; one active per user otherwise', async () => {
+    await register(910003);
+    fakeGateway.sent = [];
+    await createTicketViaWizard(910003, 'پیام اول', '🎧 پشتیبانی', 'توضیحات کامل پیام اول کاربر');
+    fakeGateway.sent = [];
     expect(await count('tickets')).toBe(1);
-    expect(await count('messages', `role = 'USER'`)).toBe(2);
+
+    // while the first ticket is ACTIVE the wizard refuses a second one
+    await postUpdate(messageUpdate(910003, '🎫 ثبت تیکت جدید'));
+    await botSent(1);
+    expect(fakeGateway.sent.at(-1)!.text).toContain('تیکت فعال دارید');
+    fakeGateway.sent = [];
 
     // admin closes the ticket via the panel API
     const [t1] = await ds.query('SELECT id FROM tickets');
@@ -174,23 +257,23 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect(res.status).toBe(200);
     expect(res.body.data.changed).toBe(true);
 
-    // user writes again → a NEW ticket with a FRESH conversation (no old messages)
-    await postUpdate(messageUpdate(910003, 'پیام بعد از بستن تیکت'));
+    // the wizard now creates a NEW ticket with a FRESH conversation
+    await createTicketViaWizard(910003, 'مشکل جدید', '⚙️ فنی', 'توضیحات کامل مشکل جدید کاربر');
     await waitFor(async () => (await count('tickets')) === 2);
-    await assistantSent(3);
 
     expect(await count('tickets', `status = 'OPEN'`)).toBe(1); // one active per user
     const [newest] = await ds.query(
       'SELECT id FROM tickets ORDER BY created_at DESC LIMIT 1',
     );
     const newTicketMsgCount = await count('messages', `ticket_id = '${newest.id}'`);
-    expect(newTicketMsgCount).toBe(3); // announcement + user message + reply — history stayed in the old ticket
+    expect(newTicketMsgCount).toBe(2); // description + announcement — history stayed in the old ticket
   });
 
   it('scenario 6: ticket memories stay isolated between users', async () => {
-    await postUpdate(messageUpdate(920001, 'متن محرمانه کاربر الف'));
-    await postUpdate(messageUpdate(920002, 'متن محرمانه کاربر ب'));
-    await assistantSent(2);
+    await register(920001);
+    await register(920002);
+    await createTicketViaWizard(920001, 'تیکت کاربر الف', '🎧 پشتیبانی', 'متن محرمانه کاربر الف با جزئیات');
+    await createTicketViaWizard(920002, 'تیکت کاربر ب', '💰 مالی', 'متن محرمانه کاربر ب با جزئیات');
 
     const tickets = await ds.query(
       'SELECT t.id, u.telegram_id FROM tickets t JOIN telegram_users u ON u.id = t.user_id',
@@ -209,17 +292,20 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect(JSON.stringify(msgsB)).not.toContain('کاربر الف');
   });
 
-  it('scenario 14: AI disabled from the panel → fixed "recorded" reply (no provider call)', async () => {
+  it('scenario 14: AI disabled from the panel → the general chat answers the fixed fallback (no provider call)', async () => {
+    await register(910004);
+    fakeGateway.sent = [];
     await authed(
       request(app.getHttpServer()).patch('/api/settings/assistant').send({ is_active: false }),
     ).expect(200);
 
     await postUpdate(messageUpdate(910004, 'سلام'));
-    await assistantSent(1);
+    await botSent(1);
 
-    const [reply] = await ds.query(`SELECT content, meta FROM messages WHERE role = 'ASSISTANT'`);
-    expect(reply.content).toBe(AI_INACTIVE_MESSAGE);
-    expect(reply.meta.reason).toBe('assistant-disabled-by-admin');
+    const reply = fakeGateway.sent.at(-1)!;
+    // the exact honest fallback for a disabled assistant, sent ephemerally:
+    expect(reply.text).toBe(AI_FALLBACK_MESSAGE);
+    expect(await count('messages')).toBe(0); // nothing stored — no provider call happened
 
     // restore for the remaining tests
     await authed(
@@ -228,8 +314,8 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('scenario 7: status transitions — 400 invalid, no-op same status, notification SENT, 409 reopen with other active ticket', async () => {
-    await postUpdate(messageUpdate(930001, 'مشکل تست وضعیت'));
-    await assistantSent(1);
+    await register(930001);
+    await createTicketViaWizard(930001, 'مشکل تست وضعیت', '🎧 پشتیبانی', 'توضیحات کامل مشکل تست وضعیت');
     const [t] = await ds.query('SELECT * FROM tickets');
     const api = `/api/tickets/${t.id}/status`;
 
@@ -261,9 +347,9 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect(sys.delivery_status).toBe('SENT');
     expect(sys.content).toContain(t.ticket_number);
 
-    // close, let the user open a new ticket, then try to reopen the old one → 409
+    // close, let the user run the wizard again, then try to reopen the old one → 409
     await authed(request(app.getHttpServer()).patch(api).send({ status: 'CLOSED' })).expect(200);
-    await postUpdate(messageUpdate(930001, 'مشکل جدید'));
+    await createTicketViaWizard(930001, 'مشکل جدید', '⚙️ فنی', 'توضیحات کامل مشکل جدید پس از بستن');
     await waitFor(async () => (await count('tickets')) === 2);
 
     const reopen = await authed(request(app.getHttpServer()).patch(api).send({ status: 'OPEN' }));
@@ -299,9 +385,9 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
 
   it('lists return { data, meta } with server-side pagination', async () => {
     for (let i = 0; i < 3; i++) {
-      await postUpdate(messageUpdate(912_000 + i, `درخواست شماره ${i + 1}`));
+      await register(912_000 + i);
+      await createTicketViaWizard(912_000 + i, `درخواست شماره ${i + 1}`, '🎧 پشتیبانی', `توضیحات کامل درخواست شماره ${i + 1}`);
     }
-    await assistantSent(3);
 
     const list = await authed(
       request(app.getHttpServer()).get('/api/tickets?page=1&limit=2'),
@@ -315,7 +401,19 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
 
   it('sweeper re-drives updates left RECEIVED by a crash (boot/between ingest and enqueue)', async () => {
     // simulate: the process died right after storing the update, before processing
-    const payload = messageUpdate(940001, 'پیام بعد از کرش');
+    // — a wizard-finalize update whose TICKET_RETRY state the user already had
+    await register(940001);
+    await postUpdate(messageUpdate(940001, '🎫 ثبت تیکت جدید'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('عنوان تیکت')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(940001, 'مشکل پس از کرش'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('دپارتمان')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(940001, '⚙️ فنی'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('متن درخواست')));
+    fakeGateway.sent = [];
+
+    const payload = messageUpdate(940001, 'توضیحات کامل درخواستی که پردازشش نشد');
     await ds.query(`INSERT INTO bot_updates (update_id, payload, status) VALUES ($1, $2, 'RECEIVED')`, [
       String(payload.update_id),
       JSON.stringify(payload),
@@ -324,8 +422,7 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     const sweeper = app.get(SweeperService);
     await sweeper.sweep('cron');
 
-    await assistantSent(1);
-    expect(await count('tickets')).toBe(1);
+    await waitFor(async () => (await count('tickets')) === 1);
     const inbox = await ds.query(`SELECT status FROM bot_updates WHERE update_id = '${payload.update_id}'`);
     expect(inbox[0].status).toBe('DONE');
   });
@@ -341,20 +438,26 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   /* Review fixes — crash recovery, outbox concurrency, validation      */
   /* ------------------------------------------------------------------ */
 
-  /** Simulates the exact DB state a crash leaves behind after addUserMessage. */
-  async function seedCrashedAfterUserMessage(
+  /** Simulates the exact DB state a crash leaves behind mid TICKET_REPLY:
+   *  the user message is stored, its reply may or may not exist yet. */
+  async function seedCrashedTicketReply(
     tgId: number,
     text: string,
     withReply: boolean,
   ): Promise<void> {
     const payload = messageUpdate(tgId, text);
     const [user] = await ds.query(
-      `INSERT INTO telegram_users (telegram_id, chat_id, first_name) VALUES ($1, $1, 'کاربر تست کرش') RETURNING *`,
-      [String(tgId)],
+      `INSERT INTO telegram_users (telegram_id, chat_id, first_name, full_name, phone, profile_completed_at, bot_state)
+       VALUES ($1, $1, 'کاربر تست کرش', 'کاربر تست کرش', '09121234567', now(), $2) RETURNING *`,
+      [String(tgId), JSON.stringify({ flow: 'TICKET_REPLY', data: {}, updated_at: new Date().toISOString() })],
     );
     const [ticket] = await ds.query(
-      `INSERT INTO tickets (user_id, subject) VALUES ($1, $2) RETURNING *`,
-      [user.id, 'بازیابی پس از کرش'],
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'بازیابی پس از کرش') RETURNING *`,
+      [user.id],
+    );
+    await ds.query(
+      `UPDATE telegram_users SET bot_state = $2 WHERE id = $1`,
+      [user.id, JSON.stringify({ flow: 'TICKET_REPLY', data: { ticketId: ticket.id }, updated_at: new Date().toISOString() })],
     );
     const [userMessage] = await ds.query(
       `INSERT INTO messages (ticket_id, role, content, telegram_update_id) VALUES ($1, 'USER', $2, $3) RETURNING id`,
@@ -373,8 +476,8 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     );
   }
 
-  it('CRASH RECOVERY #1a: user message stored but reply missing → re-run RESUMES and answers', async () => {
-    await seedCrashedAfterUserMessage(950001, 'پیام بعد از کرش', false);
+  it('CRASH RECOVERY #1a: a stored TICKET_REPLY message without a reply → re-run RESUMES and answers', async () => {
+    await seedCrashedTicketReply(950001, 'پیام بعد از کرش', false);
 
     await app.get(SweeperService).sweep('cron');
     await assistantSent(1);
@@ -382,14 +485,13 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     // exactly one user message, one reply — the crash no longer swallows the answer
     expect(await count('messages', `role = 'USER'`)).toBe(1);
     expect(await count('messages', `role = 'ASSISTANT'`)).toBe(1);
-    const [update] = await ds.query(`SELECT status, stage, last_error FROM bot_updates`);
+    const [update] = await ds.query(`SELECT status, last_error FROM bot_updates`);
     expect(update.status).toBe('DONE');
-    expect(update.stage).toBe('REPLY_SAVED');
     expect(update.last_error).toBeNull();
   });
 
   it('CRASH RECOVERY #1b: reply already stored → re-run finishes WITHOUT a second AI reply or resend', async () => {
-    await seedCrashedAfterUserMessage(950002, 'پیام کامل‌شده', true);
+    await seedCrashedTicketReply(950002, 'پیام کامل‌شده', true);
 
     await app.get(SweeperService).sweep('cron');
     await waitFor(async () => {
@@ -403,8 +505,12 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('CRASH RECOVERY #1c: last_error is preserved when a poisoned update exhausts its attempts', async () => {
-    await postUpdate(messageUpdate(950003, 'خطای موقت'));
-    await assistantSent(1);
+    await postUpdate(messageUpdate(950003, '/start'));
+    await botSent(1);
+    await waitFor(async () => {
+      const rows = await ds.query(`SELECT status FROM bot_updates`);
+      return rows[0]?.status === 'DONE';
+    });
 
     // simulate a worker that kept failing on this update and finally died:
     // stale lock, max attempts, and a recorded last_error
@@ -488,8 +594,8 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('STATUS #4-a: CLOSED → IN_PROGRESS with another active ticket → 409, never a 500', async () => {
-    await postUpdate(messageUpdate(950300, 'تیکت اول'));
-    await assistantSent(1);
+    await register(950300);
+    await createTicketViaWizard(950300, 'تیکت اول', '🎧 پشتیبانی', 'توضیحات کامل تیکت اول کاربر');
     const tickets = await ds.query(`SELECT id FROM tickets ORDER BY created_at ASC`);
     const first = tickets[0];
 
@@ -497,7 +603,7 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
       request(app.getHttpServer()).patch(`/api/tickets/${first.id}/status`).send({ status: 'CLOSED' }),
     ).expect(200);
 
-    await postUpdate(messageUpdate(950300, 'تیکت دوم'));
+    await createTicketViaWizard(950300, 'تیکت دوم', '⚙️ فنی', 'توضیحات کامل تیکت دوم کاربر');
     await waitFor(async () => (await count('tickets')) === 2);
 
     const res = await authed(
@@ -603,10 +709,10 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('ADMIN REPLY: panel reply → ADMIN outbox row → Telegram delivery + realtime badges + last-activity bump', async () => {
-    await postUpdate(messageUpdate(950800, 'سلام، منتظر پاسخ هستم'));
-    await assistantSent(1);
-
+    await register(950800);
+    await createTicketViaWizard(950800, 'تیکت پاسخ کارشناس', '🎧 پشتیبانی', 'متن کامل درخواست کاربر 950800');
     const [ticket] = await ds.query(`SELECT id, last_message_at FROM tickets`);
+    fakeGateway.sent = [];
     const before = new Date(ticket.last_message_at as string);
 
     // realtime: the panel must see the reply the moment it commits and its
@@ -696,8 +802,8 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('ADMIN REPLY IDEMPOTENCY: a retry with the SAME client_message_id replays the original — never a duplicate send', async () => {
-    await postUpdate(messageUpdate(950801, 'سلام، پیگیری می‌کنم'));
-    await assistantSent(1);
+    await register(950801);
+    await createTicketViaWizard(950801, 'تیکت پیگیری', '💰 مالی', 'متن کامل درخواست کاربر 950801');
     const [ticket] = await ds.query(`SELECT id FROM tickets`);
 
     const first = await authed(
@@ -735,8 +841,8 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('ADMIN REPLY IDEMPOTENCY (content-bound): the SAME key with DIFFERENT content is a 409, never a replay', async () => {
-    await postUpdate(messageUpdate(950802, 'سلام، ویرایش پاسخ'));
-    await assistantSent(1);
+    await register(950802);
+    await createTicketViaWizard(950802, 'تیکت ویرایش', '⚙️ فنی', 'متن کامل درخواست کاربر 950802');
     const [ticket] = await ds.query(`SELECT id FROM tickets`);
 
     const first = await authed(
@@ -769,7 +875,22 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('ORDERING GATE (review fix): a later message of the same chat waits while an earlier one is unfinished', async () => {
-    await postUpdate(messageUpdate(950810, 'پیام اول'));
+    // a user mid TICKET_REPLY: message 1 goes into the ticket and gets stuck
+    const [user] = await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id, first_name, full_name, phone, profile_completed_at)
+       VALUES ('950810', '950810', 'کاربر ترتیب', 'کاربر ترتیب کامل', '09121234567', now()) RETURNING *`,
+    );
+    const [seedTicket] = await ds.query(
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'ترتیب پیام‌ها') RETURNING *`,
+      [user.id],
+    );
+    await ds.query(
+      `UPDATE telegram_users SET bot_state = $2 WHERE id = $1`,
+      [user.id, JSON.stringify({ flow: 'TICKET_REPLY', data: { ticketId: seedTicket.id }, updated_at: new Date().toISOString() })],
+    );
+
+    const first = messageUpdate(950810, 'پیام اول');
+    await postUpdate(first);
     await assistantSent(1);
 
     // simulate a crash AFTER message 1 was stored: its reply is gone and the
@@ -802,10 +923,10 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     await app.get(SweeperService).sweep('cron');
     await assistantSent(2);
 
-    const [first] = await ds.query(`SELECT status FROM bot_updates WHERE update_id = $1`, [
+    const [firstDone] = await ds.query(`SELECT status FROM bot_updates WHERE update_id = $1`, [
       firstUpdate.update_id,
     ]);
-    expect(first.status).toBe('DONE');
+    expect(firstDone.status).toBe('DONE');
     expect(await count('bot_updates', `status = 'DONE'`)).toBe(2);
 
     // hard proof of no overtaking: the reply to message 1 was stored BEFORE
@@ -828,53 +949,64 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     );
 
     await postUpdate(messageUpdate(950820, 'سلام دوباره'));
-    await assistantSent(1);
+    await botSent(1); // the (registration) reply reached the chat
 
     const [user] = await ds.query(
       `SELECT is_blocked FROM telegram_users WHERE telegram_id = '950820'`,
     );
     expect(user.is_blocked).toBe(false); // the stale flag healed
-    expect(await count('messages', `role = 'USER'`)).toBe(1);
-    expect(await count('tickets')).toBe(1);
     const [update] = await ds.query(`SELECT status FROM bot_updates`);
     expect(update.status).toBe('DONE'); // previously such messages were silently dropped
-    expect(fakeGateway.sent.length).toBeGreaterThanOrEqual(1); // the reply reached the chat
+    expect(fakeGateway.sent.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('CRASH RECOVERY (empty-ticket fix): retrying a stored message NEVER opens a second, empty active ticket', async () => {
-    await postUpdate(messageUpdate(950830, 'پیام با کرش در بازبینی'));
-    await assistantSent(1);
+  it('CRASH RECOVERY (empty-ticket fix): retrying the wizard FINALIZE never opens a second ticket', async () => {
+    await register(950830);
+    await postUpdate(messageUpdate(950830, '🎫 ثبت تیکت جدید'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('عنوان تیکت')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(950830, 'مشکل با کرش در بازبینی'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('دپارتمان')));
+    fakeGateway.sent = [];
+    await postUpdate(messageUpdate(950830, '💰 مالی'));
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('متن درخواست')));
+    fakeGateway.sent = [];
+
+    const finalize = messageUpdate(950830, 'متن کامل درخواستی که کرش کرد');
+    await postUpdate(finalize);
+    await waitFor(() => fakeGateway.sent.some((s) => s.text.includes('تیکت شما با موفقیت ثبت شد')));
+    const [ticket] = await ds.query(`SELECT id FROM tickets`);
 
     // the operator closes the ORIGINAL ticket during the retry window
-    const [ticket] = await ds.query(`SELECT id FROM tickets`);
     await authed(
       request(app.getHttpServer()).patch(`/api/tickets/${ticket.id}/status`).send({ status: 'CLOSED' }),
     ).expect(200);
 
-    // simulate the crash: the update sits in stale PROCESSING with its user
-    // message already stored (the reply is deleted so the retry has real work)
-    await ds.query(`DELETE FROM messages WHERE role = 'ASSISTANT'`);
+    // simulate the crash: the finalize update sits in stale PROCESSING AFTER
+    // its work completed (message stored, state cleared)
     await ds.query(
-      `UPDATE bot_updates SET status = 'PROCESSING', stage = 'USER_SAVED',
-       locked_at = now() - interval '3 minutes'`,
+      `UPDATE bot_updates SET status = 'PROCESSING', locked_at = now() - interval '3 minutes'
+       WHERE update_id = $1`,
+      [String(finalize.update_id)],
     );
 
     await app.get(SweeperService).sweep('cron');
-    await assistantSent(1);
+    await waitFor(async () => {
+      const [u] = await ds.query(`SELECT status FROM bot_updates WHERE update_id = $1`, [
+        String(finalize.update_id),
+      ]);
+      return u?.status === 'DONE';
+    });
 
-    // THE assertion: exactly ONE ticket exists — the retry resumed inside the
-    // ORIGINAL (closed) ticket instead of creating a fresh, EMPTY active one
+    // THE assertion: exactly ONE ticket exists — the dedup-first check pinned
+    // the retry to the ORIGINAL (closed) ticket instead of a fresh, empty one
     expect(await count('tickets')).toBe(1);
     expect(await count('tickets', `status <> 'CLOSED'`)).toBe(0); // no empty ACTIVE ticket left behind
     expect(await count('messages', `role = 'USER'`)).toBe(1);
-    expect(await count('messages', `role = 'ASSISTANT'`)).toBe(1);
-
-    // the regenerated reply landed in the ORIGINAL ticket — next to its user message
-    const [reply] = await ds.query(`SELECT ticket_id FROM messages WHERE role = 'ASSISTANT'`);
-    expect(reply.ticket_id).toBe(ticket.id);
-    const [update] = await ds.query(`SELECT status, stage FROM bot_updates`);
+    const [update] = await ds.query(`SELECT status FROM bot_updates WHERE update_id = $1`, [
+      String(finalize.update_id),
+    ]);
     expect(update.status).toBe('DONE');
-    expect(update.stage).toBe('REPLY_SAVED');
   });
 
   it('CURSOR VALIDATION: out-of-bigint-range and zero cursors are 400s, the bigint max is accepted', async () => {
@@ -904,8 +1036,8 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   it('VALIDATION: /users/:id rejects non-uuid with 400; ticket list embeds the owner', async () => {
     await authed(request(app.getHttpServer()).get('/api/users/not-a-uuid')).expect(400);
 
-    await postUpdate(messageUpdate(950500, 'سلام از کاربر جدید'));
-    await assistantSent(1);
+    await register(950500);
+    await createTicketViaWizard(950500, 'تیکت کاربر جدید', '🎧 پشتیبانی', 'متن کامل درخواست کاربر جدید 950500');
 
     const list = await authed(request(app.getHttpServer()).get('/api/tickets')).expect(200);
     expect(list.body.data).toHaveLength(1);
@@ -945,6 +1077,7 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect((await post(messageUpdate(950750, 'پیام سالم'))).status).toBe(200);
 
     expect(await count('bot_updates')).toBe(1); // only the healthy one
+    await botSent(1); // its processing (the registration prompt) finished BEFORE the next test
   });
 
   it('RETRY BACKOFF (review round 5 #1): a transient failure schedules a real backoff, the sweeper honors it, and the panel can retry manually', async () => {
@@ -1066,17 +1199,17 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
   });
 
   it('RETENTION: old inbox rows are purged; conversation history is untouched', async () => {
-    await postUpdate(messageUpdate(950600, 'پیام برای نگهداری'));
-    await assistantSent(1);
-    expect(await count('bot_updates')).toBe(1);
+    await register(950600);
+    await createTicketViaWizard(950600, 'پیام برای نگهداری', '🎧 پشتیبانی', 'متن کامل درخواست برای تست نگهداری');
+    expect(await count('bot_updates')).toBeGreaterThanOrEqual(1);
 
     // age the raw payload beyond the 30-day default
     await ds.query(`UPDATE bot_updates SET received_at = now() - interval '40 days'`);
 
     const removed = await app.get(InboxRetentionService).run('cron');
-    expect(removed).toBe(1);
+    expect(removed).toBeGreaterThanOrEqual(1);
     expect(await count('bot_updates')).toBe(0);
-    expect(await count('messages')).toBeGreaterThanOrEqual(3); // history intact
+    expect(await count('messages')).toBeGreaterThanOrEqual(2); // history intact
   });
 
   it('WEBSOCKET: user:new + ticket:updated still arrive after commit (events-after-commit fix)', async () => {
@@ -1098,15 +1231,18 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
         socket.once('connect_error', (err: Error) => reject(err));
       });
 
-      // first message from a brand-new user → user:new
+      // first message from a brand-new user → user:new (fires on the upsert,
+      // before any profile gating — the panel sees new users immediately)
       const userEvent = nextEvent('user:new');
       await postUpdate(messageUpdate(950700, 'پیام وب‌سوکت'));
       await expect(userEvent).resolves.toMatchObject({
         user: { telegram_id: '950700' },
       });
-      await assistantSent(1);
 
-      // admin status change → ticket:updated + message:new (system notification)
+      // the user registers + creates a ticket, then an admin status change
+      // → ticket:updated (+ the SYSTEM notification as message:new)
+      await register(950700);
+      await createTicketViaWizard(950700, 'تیکت وب‌سوکت', '⚙️ فنی', 'توضیحات کامل تیکت وب‌سوکت کاربر');
       const [t] = await ds.query(`SELECT id FROM tickets`);
       const ticketEvent = nextEvent('ticket:updated');
       await authed(

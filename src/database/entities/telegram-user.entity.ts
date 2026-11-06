@@ -34,6 +34,36 @@ export class TelegramUser {
   @Column({ type: 'boolean', default: false })
   is_blocked: boolean;
 
+  /**
+   * Full name collected by the MANDATORY registration flow (feature round) —
+   * deliberately separate from the Telegram-profile first/last_name, which the
+   * upsert refreshes on every message and the user does not control.
+   */
+  @Column({ type: 'varchar', length: 120, nullable: true })
+  full_name: string | null;
+
+  /** Normalized Iranian mobile (09xxxxxxxxx) collected at registration step 2. */
+  @Column({ type: 'varchar', length: 20, nullable: true })
+  phone: string | null;
+
+  /** Completion flag of the mandatory profile — NULL until name + phone are stored. */
+  @Column({ type: 'timestamptz', nullable: true })
+  profile_completed_at: Date | null;
+
+  /**
+   * Per-user conversation state machine (registration step, ticket wizard,
+   * ticket view/reply, general-chat history). DB-backed so restarts and
+   * sweeper requeues never drop the user's position; the BotStateService
+   * enforces a TTL on read so stale state cannot linger. Structural typing
+   * here — the strict shape lives with the conversation module.
+   */
+  @Column({ type: 'jsonb', nullable: true })
+  bot_state: {
+    flow: string;
+    data?: Record<string, unknown>;
+    updated_at?: string;
+  } | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   created_at: Date;
 

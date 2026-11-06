@@ -9,6 +9,18 @@ export enum TicketStatus {
   CLOSED = 'CLOSED',
 }
 
+/**
+ * Ticket departments chosen in the registration wizard (feature round:
+ * عنوان → دپارتمان → متن). Stored as varchar + CHECK in the migration, so the
+ * Persian labels live ONLY here and in the keyboard factory.
+ */
+export enum TicketDepartment {
+  FINANCE = 'FINANCE',
+  SUPPORT = 'SUPPORT',
+  TECHNICAL = 'TECHNICAL',
+  SUGGESTIONS = 'SUGGESTIONS',
+}
+
 export enum MessageRole {
   USER = 'USER',
   ASSISTANT = 'ASSISTANT',

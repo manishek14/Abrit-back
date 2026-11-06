@@ -135,10 +135,20 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
     }
   }
 
-  async sendMessage(params: { chat_id: string; text: string }): Promise<{ message_id: string }> {
+  async sendMessage(params: {
+    chat_id: string;
+    text: string;
+    reply_markup?: unknown;
+    parse_mode?: 'HTML';
+  }): Promise<{ message_id: string }> {
     try {
       const res = (await this.withSendTimeout(
-        this.bot.telegram.sendMessage(params.chat_id, params.text),
+        this.bot.telegram.sendMessage(params.chat_id, params.text, {
+          // flow keyboards (reply/inline) and HTML templates pass through;
+          // plain outbox sends keep the exact old call shape
+          ...(params.reply_markup ? { reply_markup: params.reply_markup as never } : {}),
+          ...(params.parse_mode ? { parse_mode: params.parse_mode } : {}),
+        }),
       )) as { message_id: number };
       return { message_id: String(res.message_id) };
     } catch (e) {
@@ -146,6 +156,16 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
       // through untouched so it stays TRANSIENT (retried with backoff)
       if (e instanceof TelegramApiError) throw e;
       throw this.mapError(e);
+    }
+  }
+
+  /** Stops the inline-button spinner. Informational — failures are logged and
+   *  swallowed: a lost answerCallbackQuery degrades UX, never correctness. */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    try {
+      await this.bot.telegram.answerCbQuery(callbackQueryId, text || undefined);
+    } catch (e) {
+      this.logger.warn(`answerCallbackQuery failed (informational): ${(e as Error).message}`);
     }
   }
 

@@ -96,3 +96,86 @@ describe('UsersService', () => {
     });
   });
 });
+
+describe('UsersService — profile & state (feature round)', () => {
+  let service: UsersService;
+  let repo: { query: jest.Mock; findOneBy: jest.Mock; update: jest.Mock };
+  let events: { emit: jest.Mock };
+
+  beforeEach(() => {
+    repo = { query: jest.fn(), findOneBy: jest.fn(), update: jest.fn() };
+    events = { emit: jest.fn() };
+    service = new UsersService(
+      repo as unknown as Repository<TelegramUser>,
+      events as unknown as EventsService,
+    );
+  });
+
+  it('completeProfile writes name + phone + the completion timestamp in ONE update', async () => {
+    const updated = { id: 'u-1', full_name: 'علی رضایی', phone: '09123456789' };
+    repo.update.mockResolvedValueOnce({});
+    repo.findOneBy.mockResolvedValueOnce(updated as TelegramUser);
+
+    const out = await service.completeProfile('u-1', {
+      full_name: 'علی رضایی',
+      phone: '09123456789',
+    });
+
+    expect(repo.update).toHaveBeenCalledWith(
+      { id: 'u-1' },
+      expect.objectContaining({ full_name: 'علی رضایی', phone: '09123456789' }),
+    );
+    const patch = repo.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(patch.profile_completed_at).toBeInstanceOf(Date);
+    expect(out).toBe(updated);
+  });
+
+  it('isProfileComplete requires the timestamp AND both fields (a half profile is NOT complete)', () => {
+    const base = { id: 'u-1' } as TelegramUser;
+    expect(service.isProfileComplete(base)).toBe(false);
+    expect(
+      service.isProfileComplete({ ...base, profile_completed_at: new Date() } as TelegramUser),
+    ).toBe(false);
+    expect(
+      service.isProfileComplete({
+        ...base,
+        profile_completed_at: new Date(),
+        full_name: 'علی',
+        phone: '09123456789',
+      } as TelegramUser),
+    ).toBe(true);
+    expect(
+      service.isProfileComplete({
+        ...base,
+        profile_completed_at: new Date(),
+        full_name: 'علی رضایی',
+      } as TelegramUser),
+    ).toBe(false); // phone missing
+    expect(
+      service.isProfileComplete({
+        ...base,
+        profile_completed_at: new Date(),
+        full_name: 'علی رضایی',
+        phone: '09123456789',
+      } as TelegramUser),
+    ).toBe(true);
+  });
+
+  it('setBotState persists the jsonb and clear passes null', async () => {
+    repo.update.mockResolvedValue({});
+    const state = { flow: 'TICKET_TITLE', data: {}, updated_at: new Date().toISOString() };
+
+    await service.setBotState('u-1', state as never);
+    expect(repo.update).toHaveBeenCalledWith({ id: 'u-1' }, { bot_state: state });
+
+    await service.setBotState('u-1', null);
+    expect(repo.update).toHaveBeenLastCalledWith({ id: 'u-1' }, { bot_state: null });
+  });
+
+  it('upsertTelegramUser does NOT touch profile/state columns (registration data survives refreshes)', async () => {
+    repo.query.mockResolvedValue([{ id: 'u-1', _was_inserted: false }]);
+    await service.upsertTelegramUser({ telegram_id: '111', username: 'sara' });
+    const sql = repo.query.mock.calls[0][0] as string;
+    expect(sql).not.toMatch(/full_name|bot_state|profile_completed_at/);
+  });
+});

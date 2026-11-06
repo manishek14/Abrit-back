@@ -21,4 +21,9 @@ export class InactiveGateway implements TelegramGateway {
   setUpdateHandler(_handler: (update: RawTelegramUpdate) => Promise<void>): void {
     /* no transport — updates only arrive via the webhook controller in tests */
   }
+
+  answerCallbackQuery(_callbackQueryId: string, _text?: string): Promise<void> {
+    /* no transport — nothing to answer */
+    return Promise.resolve();
+  }
 }

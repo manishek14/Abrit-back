@@ -47,6 +47,46 @@ export function isValidUpdateShape(update: unknown): update is RawTelegramUpdate
     if (from !== undefined && !isPlainObject(from)) return false;
     if (message.text !== undefined && typeof message.text !== 'string') return false;
     if (message.date !== undefined && typeof message.date !== 'number') return false;
+    // contact (registration step 2): structurally checked when present
+    if (message.contact !== undefined) {
+      if (!isPlainObject(message.contact)) return false;
+      if (
+        message.contact.phone_number !== undefined &&
+        typeof message.contact.phone_number !== 'string'
+      ) {
+        return false;
+      }
+      if (
+        message.contact.user_id !== undefined &&
+        !['number', 'string'].includes(typeof message.contact.user_id)
+      ) {
+        return false;
+      }
+    }
+  }
+
+  // callback_query (inline keyboards — my-tickets): the orchestrator reads
+  // id/from/message.chat unconditionally, so the same "shape before storage"
+  // rule applies to it as to messages.
+  const cb = update.callback_query;
+  if (cb !== undefined) {
+    if (!isPlainObject(cb)) return false;
+    if (typeof cb.id !== 'string' || cb.id.length === 0 || cb.id.length > 128) return false;
+    if (!isPlainObject(cb.from)) return false;
+    if (!['number', 'string'].includes(typeof cb.from.id)) return false;
+    if (cb.message !== undefined) {
+      if (!isPlainObject(cb.message)) return false;
+      const chat = cb.message.chat;
+      if (!isPlainObject(chat) || !['number', 'string'].includes(typeof chat.id)) return false;
+      if (typeof chat.type !== 'string') return false;
+      if (
+        cb.message.message_id !== undefined &&
+        (typeof cb.message.message_id !== 'number' || !Number.isInteger(cb.message.message_id))
+      ) {
+        return false;
+      }
+    }
+    if (cb.data !== undefined && typeof cb.data !== 'string') return false;
   }
 
   try {

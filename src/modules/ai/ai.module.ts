@@ -4,6 +4,7 @@ import { MessagesModule } from '../messages/messages.module';
 import { SettingsModule } from '../settings/settings.module';
 import { ContextBuilderService } from './context-builder.service';
 import { AiReplyProvider } from './ai-reply.provider';
+import { GeneralChatService } from './general-chat.service';
 import { AI_PROVIDER, AiProvider } from './ai-provider.interface';
 import { OpenRouterProvider } from './openrouter.provider';
 import { REPLY_PROVIDER } from './reply-provider.interface';
@@ -19,8 +20,9 @@ import { REPLY_PROVIDER } from './reply-provider.interface';
     { provide: AI_PROVIDER, useFactory: (): AiProvider => new OpenRouterProvider(getEnv()) },
     ContextBuilderService,
     AiReplyProvider,
+    GeneralChatService,
     { provide: REPLY_PROVIDER, useExisting: AiReplyProvider },
   ],
-  exports: [REPLY_PROVIDER],
+  exports: [REPLY_PROVIDER, GeneralChatService],
 })
 export class AiModule {}

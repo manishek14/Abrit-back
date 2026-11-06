@@ -84,3 +84,77 @@ describe('isValidUpdateShape (webhook input validation — review fix #4-c)', ()
     expect(isValidUpdateShape(huge)).toBe(false);
   });
 });
+
+describe('isValidUpdateShape — callback queries & contacts (feature round)', () => {
+  const validCallback = (over: Record<string, unknown> = {}) => ({
+    update_id: 200,
+    callback_query: {
+      id: 'cb-1',
+      from: { id: 111, is_bot: false, first_name: 'سارا' },
+      message: { message_id: 5, chat: { id: 111, type: 'private' } },
+      data: 'myt:page:2',
+    },
+    ...over,
+  });
+
+  it('accepts a valid callback query (my-tickets pagination)', () => {
+    expect(isValidUpdateShape(validCallback())).toBe(true);
+  });
+
+  it('accepts a callback without the embedded message / data (defensive shapes)', () => {
+    expect(
+      isValidUpdateShape({
+        update_id: 201,
+        callback_query: { id: 'cb-2', from: { id: 111 }, data: 'myt:noop' },
+      }),
+    ).toBe(true);
+  });
+
+  it.each([
+    ['missing id', { update_id: 202, callback_query: { from: { id: 111 } } }],
+    ['empty id', { update_id: 203, callback_query: { id: '', from: { id: 111 } } }],
+    ['non-string id', { update_id: 204, callback_query: { id: 5, from: { id: 111 } } }],
+    ['missing from', { update_id: 205, callback_query: { id: 'cb' } }],
+    ['bad embedded chat', { update_id: 206, callback_query: { id: 'cb', from: { id: 1 }, message: { chat: { type: 'private' } } } }],
+    ['non-string data', { update_id: 207, callback_query: { id: 'cb', from: { id: 1 }, data: 5 } }],
+  ])('rejects a callback with %s', (_name, update) => {
+    expect(isValidUpdateShape(update)).toBe(false);
+  });
+
+  it('accepts a contact message (registration request_contact button)', () => {
+    expect(
+      isValidUpdateShape({
+        update_id: 210,
+        message: {
+          message_id: 1,
+          from: { id: 111 },
+          chat: { id: 111, type: 'private' },
+          contact: { phone_number: '+989123456789', user_id: 111 },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed contact payloads', () => {
+    expect(
+      isValidUpdateShape({
+        update_id: 211,
+        message: {
+          message_id: 1,
+          chat: { id: 111, type: 'private' },
+          contact: '09123456789',
+        },
+      }),
+    ).toBe(false);
+    expect(
+      isValidUpdateShape({
+        update_id: 212,
+        message: {
+          message_id: 1,
+          chat: { id: 111, type: 'private' },
+          contact: { phone_number: 123 },
+        },
+      }),
+    ).toBe(false);
+  });
+});

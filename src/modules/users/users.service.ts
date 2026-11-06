@@ -78,6 +78,42 @@ export class UsersService {
     return this.repo.findOneBy({ id });
   }
 
+  /**
+   * Completes the MANDATORY profile (feature round): the registration flow's
+   * final write — name + normalized phone + the completion timestamp, in ONE
+   * update so a crash can never leave a half profile that reads as complete.
+   */
+  async completeProfile(
+    id: string,
+    profile: { full_name: string; phone: string },
+  ): Promise<TelegramUser> {
+    await this.repo.update(
+      { id },
+      { full_name: profile.full_name, phone: profile.phone, profile_completed_at: new Date() },
+    );
+    return (await this.repo.findOneBy({ id }))!;
+  }
+
+  /** Profile completeness flag — the gate for every main bot feature (§1). */
+  isProfileComplete(user: TelegramUser): boolean {
+    return (
+      user.profile_completed_at !== null &&
+      !!user.full_name?.trim() &&
+      !!user.phone?.trim()
+    );
+  }
+
+  /**
+   * Persists the conversation state machine row (feature round). Called only
+   * from the per-chat serialized pipeline (single instance), so a plain
+   * update is race-free; null clears the state (post-completion / cancel).
+   */
+  async setBotState(id: string, state: TelegramUser['bot_state']): Promise<void> {
+    // the jsonb deep-partial type of TypeORM's update() rejects Record values;
+    // the runtime payload is exactly the entity column's jsonb — one cast, here only
+    await this.repo.update({ id }, { bot_state: state as never });
+  }
+
   async setBlocked(id: string, is_blocked: boolean): Promise<void> {
     await this.repo.update({ id }, { is_blocked });
   }

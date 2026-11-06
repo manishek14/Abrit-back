@@ -5,12 +5,25 @@ import { TicketsModule } from '../tickets/tickets.module';
 import { UsersModule } from '../users/users.module';
 import { AiModule } from '../ai/ai.module';
 import { TelegramCoreModule } from '../telegram/telegram-core.module';
+import { BotStateService } from './bot-state.service';
 import { CommandsService } from './commands.service';
+import { FlowRouterService } from './flow-router.service';
+import { MyTicketsService } from './mytickets.service';
 import { OrchestratorService } from './orchestrator.service';
+import { RegistrationService } from './registration.service';
+import { TicketFlowService } from './ticket-flow.service';
 
 @Module({
   imports: [InboxModule, UsersModule, TicketsModule, MessagesModule, AiModule, TelegramCoreModule],
-  providers: [CommandsService, OrchestratorService],
+  providers: [
+    BotStateService,
+    RegistrationService,
+    TicketFlowService,
+    MyTicketsService,
+    CommandsService,
+    FlowRouterService,
+    OrchestratorService,
+  ],
   exports: [OrchestratorService],
 })
 export class ConversationModule {}

@@ -45,5 +45,14 @@ export function buildTypeOrmOptions(): TypeOrmModuleOptions {
     ssl,
     logging: false,
     maxQueryExecutionTime: 2000,
+    // pg pool tuning: keepalives stop firewalled/NATed idle connections from
+    // dying mid-run ("Connection terminated" during quiet test phases); a
+    // proactive idle timeout retires connections before the server can.
+    extra: {
+      max: 10,
+      idleTimeoutMillis: 30_000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10_000,
+    },
   };
 }

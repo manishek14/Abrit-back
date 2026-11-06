@@ -129,23 +129,88 @@ describe('Round 6 — liveness/readiness split & session cookies', () => {
 
       beforeAll(async () => {
         // created through the secret-protected webhook — the REAL pipeline
-        await request(app.getHttpServer())
-          .post('/api/telegram/webhook')
-          .set('x-telegram-bot-api-secret-token', 'e2e-webhook-secret')
-          .send({
-            update_id: 9_700_001,
-            message: {
-              message_id: 9_700_001,
-              from: { id: 9_700_100, is_bot: false, first_name: 'کاربر کوکی' },
-              chat: { id: 9_700_100, type: 'private' },
-              text: 'پیام برای تست CSRF',
-            },
-          })
-          .expect(200);
-        const [ticket] = await ds.query(
-          `SELECT id FROM tickets ORDER BY created_at DESC LIMIT 1`,
-        );
-        ticketId = ticket.id;
+        // (registration → wizard: the only ticket path in the feature round)
+        const post = (update: Record<string, unknown>) =>
+          request(app.getHttpServer())
+            .post('/api/telegram/webhook')
+            .set('x-telegram-bot-api-secret-token', 'e2e-webhook-secret')
+            .send(update)
+            .expect(200);
+        await post({
+          update_id: 9_700_001,
+          message: {
+            message_id: 9_700_001,
+            from: { id: 9_700_100, is_bot: false, first_name: 'کاربر کوکی' },
+            chat: { id: 9_700_100, type: 'private' },
+            text: '/start',
+          },
+        });
+        await post({
+          update_id: 9_700_002,
+          message: {
+            message_id: 9_700_002,
+            from: { id: 9_700_100, is_bot: false },
+            chat: { id: 9_700_100, type: 'private' },
+            text: 'کاربر کوکی کامل',
+          },
+        });
+        await post({
+          update_id: 9_700_003,
+          message: {
+            message_id: 9_700_003,
+            from: { id: 9_700_100, is_bot: false },
+            chat: { id: 9_700_100, type: 'private' },
+            text: '09121234567',
+          },
+        });
+        await post({
+          update_id: 9_700_004,
+          message: {
+            message_id: 9_700_004,
+            from: { id: 9_700_100, is_bot: false },
+            chat: { id: 9_700_100, type: 'private' },
+            text: '/new',
+          },
+        });
+        await post({
+          update_id: 9_700_005,
+          message: {
+            message_id: 9_700_005,
+            from: { id: 9_700_100, is_bot: false },
+            chat: { id: 9_700_100, type: 'private' },
+            text: 'تیکت تست CSRF',
+          },
+        });
+        await post({
+          update_id: 9_700_006,
+          message: {
+            message_id: 9_700_006,
+            from: { id: 9_700_100, is_bot: false },
+            chat: { id: 9_700_100, type: 'private' },
+            text: '💰 مالی',
+          },
+        });
+        await post({
+          update_id: 9_700_007,
+          message: {
+            message_id: 9_700_007,
+            from: { id: 9_700_100, is_bot: false },
+            chat: { id: 9_700_100, type: 'private' },
+            text: 'متن کامل درخواست برای تست CSRF',
+          },
+        });
+        // the wizard finalizes asynchronously — wait for the ticket to exist
+        const deadline = Date.now() + 5000;
+        let ticket: { id: string } | undefined;
+        while (Date.now() < deadline) {
+          const rows = await ds.query(`SELECT id FROM tickets ORDER BY created_at DESC LIMIT 1`);
+          if (rows.length > 0) {
+            ticket = rows[0];
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        ticketId = ticket!.id;
       });
 
       it('a cookie-authenticated MUTATION without the CSRF header is 403 (forgery blocked)', async () => {

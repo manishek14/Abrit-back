@@ -14,6 +14,7 @@ import { EventsService } from '../../common/events/events.service';
 import { isUniqueViolation } from '../../common/utils/pg-errors';
 import { escapeLike, Paginated, toPaginated } from '../../common/pagination';
 import { TICKET_STATUS_LABELS } from '../../common/ticket-labels';
+import { TicketDepartment } from '../../database/enums';
 
 export interface ChangeStatusResult {
   ticket: Ticket;
@@ -117,6 +118,101 @@ export class TicketsService {
       }
       throw e;
     }
+  }
+
+  /**
+   * The ticket wizard's FINAL step (feature round §3) — one transaction:
+   *   ticket (subject + department) → USER message (description, keyed by the
+   *   telegram update) → SYSTEM announcement (outbox, PENDING).
+   * Idempotency walls (both pre-existing):
+   *   - uq_messages_telegram_update_id → a sweeper retry of the same update
+   *     can never store the description twice (the caller checks first via
+   *     findByTelegramUpdateId — this constraint is the race-proof backstop);
+   *   - uq_active_ticket_per_user → if another active ticket appeared while
+   *     the user was in the wizard, the insert loses and we return that
+   *     ticket with created=false (no leaking 500).
+   * On failure the caller keeps the wizard state so the user can retry
+   * without losing their inputs (§4: DB error ⇒ no success message).
+   */
+  async createTicketWithFirstMessage(input: {
+    user_id: string;
+    subject: string;
+    department: TicketDepartment;
+    description: string;
+    telegram_update_id: string;
+  }): Promise<{ ticket: Ticket; created: boolean; announcement: Message | null }> {
+    try {
+      let announcement: Message | null = null;
+
+      const ticket = await this.dataSource.transaction(async (manager) => {
+        const insertResult = await manager.insert(Ticket, {
+          user_id: input.user_id,
+          subject: input.subject,
+          department: input.department,
+        });
+        const id = insertResult.identifiers[0]?.id as string;
+        const created = await manager.findOneByOrFail(Ticket, { id });
+
+        const msgRepo = manager.getRepository(Message);
+
+        // the user's description is the FIRST message of the conversation
+        await msgRepo.insert({
+          ticket_id: id,
+          role: MessageRole.USER,
+          content: input.description,
+          telegram_update_id: input.telegram_update_id,
+        });
+
+        announcement = await msgRepo.save(
+          msgRepo.create({
+            ticket_id: id,
+            role: MessageRole.SYSTEM,
+            content: `تیکت ${created.ticket_number} با عنوان «${input.subject}» در دپارتمان «${input.department}» ثبت شد.`,
+            delivery_status: DeliveryStatus.PENDING,
+          }),
+        );
+        const now = new Date();
+        await manager.update(Ticket, id, { last_message_at: now });
+        created.last_message_at = now;
+        return created;
+      });
+
+      this.events.emit('ticket.created', { ticket });
+      if (announcement) this.events.emit('message.created', { message: announcement });
+      return { ticket, created: true, announcement };
+    } catch (e) {
+      if (isUniqueViolation(e)) {
+        // either the description was already stored (sweeper retry) or another
+        // active ticket won the race — both resolve to existing data, never 500
+        const stored = await this.repo.query(
+          `SELECT ticket_id FROM messages WHERE telegram_update_id = $1 LIMIT 1`,
+          [input.telegram_update_id],
+        );
+        if (stored.length > 0) {
+          const existing = await this.repo.findOneBy({ id: stored[0].ticket_id });
+          if (existing) return { ticket: existing, created: false, announcement: null };
+        }
+        const winner = await this.findActiveTicket(input.user_id);
+        if (winner) return { ticket: winner, created: false, announcement: null };
+      }
+      throw e;
+    }
+  }
+
+  /** /mytickets (feature round §2): ONLY this user's tickets, newest first. */
+  async listUserTickets(
+    user_id: string,
+    page: number,
+    limit: number,
+  ): Promise<Paginated<Ticket>> {
+    const [items, total] = await this.repo
+      .createQueryBuilder('t')
+      .where('t.user_id = :user_id', { user_id })
+      .orderBy('t.created_at', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getManyAndCount();
+    return toPaginated(items, total, page, limit);
   }
 
   /**

@@ -1,7 +1,7 @@
 import { Column, CreateDateColumn, Entity, Index, JoinColumn, ManyToOne, OneToMany, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
 import { TelegramUser } from './telegram-user.entity';
 import { Message } from './message.entity';
-import { TicketStatus } from '../enums';
+import { TicketDepartment, TicketStatus } from '../enums';
 
 @Entity('tickets')
 export class Ticket {
@@ -26,6 +26,13 @@ export class Ticket {
 
   @Column({ type: 'varchar', length: 120, nullable: true })
   subject: string | null;
+
+  /**
+   * Department chosen in the registration wizard (FINANCE/SUPPORT/TECHNICAL/
+   * SUGGESTIONS). NULL only for tickets created before this column existed.
+   */
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  department: TicketDepartment | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   created_at: Date;
