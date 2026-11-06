@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: abrit-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: abrit
+      POSTGRES_PASSWORD: abrit
+      POSTGRES_DB: abrit
+    ports:
+      - '5432:5432'
+    volumes:
+      - abrit_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U abrit -d abrit']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  db-test:
+    image: postgres:16-alpine
+    container_name: abrit-db-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: abrit_test
+      POSTGRES_PASSWORD: abrit_test
+      POSTGRES_DB: abrit_test
+    ports:
+      - '5433:5432'
+    volumes:
+      - abrit_pgdata_test:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U abrit_test -d abrit_test']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  abrit_pgdata:
+  abrit_pgdata_test:
