@@ -1,4 +1,5 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { DataSource, EntityManager, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Message } from '../../database/entities/message.entity';
@@ -145,6 +146,11 @@ export class MessagesService {
     });
   }
 
+  /** The user message a previous attempt stored for this Telegram update, if any. */
+  async findByTelegramUpdateId(telegram_update_id: string): Promise<Message | null> {
+    return this.repo.findOneBy({ telegram_update_id });
+  }
+
   /**
    * Outbox insert — every outbound message (AI, admin, system notification) is
    * persisted as PENDING BEFORE any network attempt, so a crash can never lose it.
@@ -192,6 +198,15 @@ export class MessagesService {
    * (the operator retried because the first HTTP response was lost) returns
    * the original row — the panel-generated key is protected by a partial
    * unique index, so a duplicate reply can never reach the user twice.
+   *
+   * The key is BOUND TO THE CONTENT it was created for (review fix): a replay
+   * is only honored when the content is IDENTICAL — the same key with a
+   * DIFFERENT body is a client bug (or a stale tab) and is answered with a
+   * 409 instead of silently returning the old message, which would make the
+   * panel wipe an edited draft that was never sent. The panel-side contract:
+   * retrying an unchanged draft reuses the key; editing the draft is a NEW
+   * send with a fresh key.
+   *
    * The replay also re-fires `message.created`: if the first attempt died
    * right after commit, this heals both the panel merge and the immediate
    * delivery (the atomic claim keeps a double Telegram send impossible).
@@ -208,6 +223,11 @@ export class MessagesService {
     if (input.client_message_id) {
       const existing = await this.findAdminByClientId(input.client_message_id);
       if (existing) {
+        if (existing.content !== input.content) {
+          throw new ConflictException(
+            'client_message_id was already used for a different message — send the edited draft as a new message (the panel does this automatically)',
+          );
+        }
         this.events.emit('message.created', { message: existing });
         return { message: existing, replayed: true };
       }
@@ -233,10 +253,16 @@ export class MessagesService {
       return { message, replayed: false };
     } catch (e) {
       // Lost the concurrent replay race: the other request with the same
-      // client_message_id committed first → return THEIR message.
+      // client_message_id committed first → return THEIR message (identical
+      // content only — a different body is a 409, same as the fast path).
       if (isUniqueViolation(e) && input.client_message_id) {
         const existing = await this.findAdminByClientId(input.client_message_id);
         if (existing) {
+          if (existing.content !== input.content) {
+            throw new ConflictException(
+              'client_message_id was already used for a different message — send the edited draft as a new message (the panel does this automatically)',
+            );
+          }
           this.events.emit('message.created', { message: existing });
           return { message: existing, replayed: true };
         }
@@ -348,14 +374,28 @@ export class MessagesService {
    * concurrently. A stale lease (crashed sender) simply expires and is
    * reclaimable. Returns null when someone else owns the send or the message
    * is terminal — callers MUST skip in that case.
+   *
+   * CRASH-SAFE ATTEMPT COUNTING (review fix): the attempt counter is consumed
+   * HERE, at claim time — a sender that dies hard (process crash between claim
+   * and any bookkeeping) has still spent one of its MAX_DELIVERY_ATTEMPTS
+   * claims, so a crash loop can never deliver forever.
+   *
+   * CLAIM TOKEN / FENCING (review fix): every claim also stamps a fresh token
+   * into meta. All later writes for THIS delivery (chunk progress, SENT,
+   * FAILED, deferral) are fenced by the token, so a zombie sender whose lease
+   * expired (e.g. a multi-chunk send that outlived 60 s) cannot fight the new
+   * owner: its writes match 0 rows and it aborts as soon as it notices.
    */
   async claimForDelivery(
     messageId: string,
     leaseMs: number = DELIVERY_LEASE_MS,
   ): Promise<Message | null> {
+    const claimToken = randomUUID();
     const rows = await this.repo.query(
       `UPDATE messages
-          SET claimed_at = now()
+          SET claimed_at = now(),
+              delivery_attempts = delivery_attempts + 1,
+              meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('claim_token', $4::text)
         WHERE id = $1
           AND delivery_status IN ('PENDING', 'FAILED')
           AND delivery_attempts < $2
@@ -365,99 +405,137 @@ export class MessagesService {
             AND (meta ->> 'retry_after_until')::timestamptz > now()
           )
         RETURNING *`,
-      [messageId, MAX_DELIVERY_ATTEMPTS, Math.max(1, Math.round(leaseMs / 1000))],
+      [messageId, MAX_DELIVERY_ATTEMPTS, Math.max(1, Math.round(leaseMs / 1000)), claimToken],
     );
     return firstRawRow<Message>(rows);
   }
 
-  async markSent(messageId: string, telegram_message_id: string | null): Promise<Message> {
-    await this.repo.update(
-      { id: messageId },
-      {
-        delivery_status: DeliveryStatus.SENT,
-        telegram_message_id,
-        sent_at: new Date(),
-        error: null,
-        claimed_at: null,
-      },
+  /**
+   * Terminal SENT write — FENCED by the claim token (review fix): only the
+   * CURRENT owner can finish a message. A zombie whose lease expired matches
+   * 0 rows; null is returned and the caller must treat the send as lost.
+   */
+  async markSent(
+    messageId: string,
+    telegramMessageId: string | null,
+    claimToken: string,
+  ): Promise<Message | null> {
+    const rows = await this.repo.query(
+      `UPDATE messages
+          SET delivery_status = 'SENT',
+              telegram_message_id = $2::bigint,
+              sent_at = now(),
+              error = NULL,
+              claimed_at = NULL
+        WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
+        RETURNING *`,
+      [messageId, telegramMessageId, claimToken],
     );
-    const updated = await this.repo.findOneByOrFail({ id: messageId });
-    this.events.emit('message.updated', { message: updated });
+    const updated = firstRawRow<Message>(rows);
+    if (updated) this.events.emit('message.updated', { message: updated });
     return updated;
   }
 
-  /** Failed send → FAILED (retryable while attempts < MAX; the sweeper picks it up with backoff). */
-  async markFailed(messageId: string, error: string): Promise<Message> {
-    const current = await this.repo.findOneByOrFail({ id: messageId });
-    await this.repo.update(
-      { id: messageId },
-      {
-        delivery_status: DeliveryStatus.FAILED,
-        error: error.slice(0, 500),
-        delivery_attempts: current.delivery_attempts + 1,
-        claimed_at: null, // release the lease — next sweeper pass may retry
-      },
+  /**
+   * Failed send → FAILED (retryable while attempts < MAX; the sweeper picks it
+   * up with backoff). The attempt counter was already consumed at claim time —
+   * this write only records the outcome — and the write is fenced by the
+   * claim token (review fix).
+   */
+  async markFailed(messageId: string, error: string, claimToken: string): Promise<Message | null> {
+    const rows = await this.repo.query(
+      `UPDATE messages
+          SET delivery_status = 'FAILED',
+              error = LEFT($2::text, 500),
+              claimed_at = NULL
+        WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
+        RETURNING *`,
+      [messageId, error, claimToken],
     );
-    const updated = await this.repo.findOneByOrFail({ id: messageId });
-    this.events.emit('message.updated', { message: updated });
+    const updated = firstRawRow<Message>(rows);
+    if (updated) this.events.emit('message.updated', { message: updated });
     return updated;
   }
 
-  /** Terminal failure (403 blocked / chat not found / telegram disabled) — sweeper stops retrying. */
-  async markPermanentlyFailed(messageId: string, error: string): Promise<void> {
-    await this.repo.update(
-      { id: messageId },
-      {
-        delivery_status: DeliveryStatus.FAILED,
-        error: error.slice(0, 500),
-        delivery_attempts: MAX_DELIVERY_ATTEMPTS,
-        claimed_at: null,
-      },
+  /** Terminal failure (403 blocked / chat not found / telegram disabled) — sweeper
+   *  stops retrying. Fenced by the claim token (review fix). */
+  async markPermanentlyFailed(
+    messageId: string,
+    error: string,
+    claimToken: string,
+  ): Promise<Message | null> {
+    const rows = await this.repo.query(
+      `UPDATE messages
+          SET delivery_status = 'FAILED',
+              error = LEFT($2::text, 500),
+              delivery_attempts = $4,
+              claimed_at = NULL
+        WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
+        RETURNING *`,
+      [messageId, error, claimToken, MAX_DELIVERY_ATTEMPTS],
     );
-    const updated = await this.repo.findOneByOrFail({ id: messageId });
-    this.events.emit('message.updated', { message: updated });
+    const updated = firstRawRow<Message>(rows);
+    if (updated) this.events.emit('message.updated', { message: updated });
+    return updated;
   }
 
-  /** Telegram 429 — park the message until retry_after elapses (meta.retry_after_until). */
-  async deferRetry(messageId: string, retryAfterSeconds: number): Promise<void> {
-    const current = await this.repo.findOneByOrFail({ id: messageId });
+  /** Telegram 429 — park the message until retry_after elapses (meta.retry_after_until).
+   *  Fenced by the claim token; the attempt was consumed at claim time. */
+  async deferRetry(
+    messageId: string,
+    retryAfterSeconds: number,
+    claimToken: string,
+  ): Promise<Message | null> {
     const until = new Date(Date.now() + retryAfterSeconds * 1000);
-    await this.repo.update(
-      { id: messageId },
-      {
-        delivery_status: DeliveryStatus.FAILED,
-        error: `rate limited by Telegram — retry after ${retryAfterSeconds}s`,
-        delivery_attempts: current.delivery_attempts + 1,
-        claimed_at: null, // retry_after_until (not the lease) now gates the retry
-        meta: { ...(current.meta ?? {}), retry_after_until: until.toISOString() },
-      },
+    const rows = await this.repo.query(
+      `UPDATE messages
+          SET delivery_status = 'FAILED',
+              error = LEFT($2::text, 500),
+              claimed_at = NULL,
+              meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('retry_after_until', $4::timestamptz)
+        WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
+        RETURNING *`,
+      [messageId, `rate limited by Telegram — retry after ${retryAfterSeconds}s`, claimToken, until.toISOString()],
     );
-    const updated = await this.repo.findOneByOrFail({ id: messageId });
-    this.events.emit('message.updated', { message: updated });
+    const updated = firstRawRow<Message>(rows);
+    if (updated) this.events.emit('message.updated', { message: updated });
+    return updated;
   }
 
   /**
    * Durable per-chunk progress for multi-part messages (review fix): after
    * EVERY successfully delivered chunk the count is committed, so a retry
-   * (sweeper or crash recovery) resumes at the first UNSSENT chunk instead of
+   * (sweeper or crash recovery) resumes at the first UNSENT chunk instead of
    * re-sending already-delivered parts to the user. The first chunk's Telegram
    * message id is kept as the conversation anchor. Atomic jsonb merge — other
-   * meta keys (model, retry_after_until…) are preserved.
+   * meta keys (model, retry_after_until, claim_token…) are preserved.
+   *
+   * FENCED by the claim token (review fix): the write only succeeds while the
+   * CURRENT claim owner is still the one sending. Returns false when the claim
+   * was lost (expired lease → another worker re-claimed) — the caller must
+   * STOP sending further chunks immediately.
+   *
+   * At-least-once honesty: a hard crash between the Telegram send of a chunk
+   * and this commit can re-send that ONE chunk on recovery — documented, and
+   * exactly the residual window of the delivery semantics.
    */
   async recordChunkSent(
     messageId: string,
     sentChunks: number,
     firstTelegramMessageId: string | null,
-  ): Promise<void> {
-    await this.repo.query(
+    claimToken: string,
+  ): Promise<boolean> {
+    const rows = await this.repo.query(
       `UPDATE messages
           SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
                 'sent_chunks', $2::int,
                 'first_telegram_message_id', COALESCE($3::text, meta->>'first_telegram_message_id')
               )
-        WHERE id = $1`,
-      [messageId, sentChunks, firstTelegramMessageId],
+        WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $4::text
+        RETURNING id`,
+      [messageId, sentChunks, firstTelegramMessageId, claimToken],
     );
+    return rows.length > 0;
   }
 
   /**
@@ -472,6 +550,12 @@ export class MessagesService {
     const firstTelegramMessageId =
       typeof meta.first_telegram_message_id === 'string' ? meta.first_telegram_message_id : null;
     return { sentChunks, firstTelegramMessageId };
+  }
+
+  /** The claim token of the worker that owns THIS delivery attempt (review fix). */
+  static readClaimToken(message: Message): string {
+    const meta = (message.meta ?? {}) as Record<string, unknown>;
+    return typeof meta.claim_token === 'string' ? meta.claim_token : '';
   }
 
   private async touchTicket(ticket_id: string): Promise<void> {

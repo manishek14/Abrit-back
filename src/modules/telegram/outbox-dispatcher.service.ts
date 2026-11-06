@@ -22,9 +22,19 @@ export function isOutboundPending(m: Message): boolean {
  * immediate path and the sweeper can never deliver the same message twice —
  * even without a crash. Multi-part messages record per-chunk progress in
  * meta (sent_chunks), so a failed/retried send resumes at the first UNSENT
- * chunk instead of duplicating already-delivered parts. Semantics remain
- * at-least-once only across a hard crash between a successful Telegram send
- * of the LAST chunk and the SENT update (documented limitation, plan §15).
+ * chunk instead of duplicating already-delivered parts.
+ *
+ * Delivery semantics are honestly AT-LEAST-ONCE (review fix — doc + hardening):
+ *   - concurrent duplicate sends are impossible (atomic claim);
+ *   - the claim consumes the attempt counter at claim time, so a hard crash
+ *     between claim and bookkeeping still burns a retry (bounded crash loops);
+ *   - all outcome writes (chunk progress, SENT, FAILED, deferral) are FENCED
+ *     by the claim token: a zombie sender whose lease expired mid-send writes
+ *     0 rows and ABORTS as soon as it notices, instead of racing the new owner;
+ *   - the ONE residual window is a hard crash between a successful Telegram
+ *     send of ANY chunk and its recordChunkSent commit — that single chunk can
+ *     be re-sent once on recovery. Exactly-once across an unacknowledged
+ *     external call is impossible; claiming otherwise would be dishonest.
  */
 @Injectable()
 export class OutboxDispatcherService implements OnModuleInit {
@@ -56,18 +66,23 @@ export class OutboxDispatcherService implements OnModuleInit {
     const claimed = await this.messagesService.claimForDelivery(message.id);
     if (!claimed) return;
 
+    // FENCING (review fix): every outcome write below is fenced by this token —
+    // if our lease expires mid-send and another worker re-claims the row, our
+    // writes match 0 rows and we abort as soon as we notice.
+    const claimToken = MessagesService.readClaimToken(claimed);
+
     const ticket = await this.ticketsService.findById(claimed.ticket_id);
     if (!ticket) {
-      await this.messagesService.markPermanentlyFailed(claimed.id, 'ticket no longer exists');
+      await this.messagesService.markPermanentlyFailed(claimed.id, 'ticket no longer exists', claimToken);
       return;
     }
     const user = await this.usersService.findByIdOrNull(ticket.user_id);
     if (!user) {
-      await this.messagesService.markPermanentlyFailed(claimed.id, 'ticket user missing');
+      await this.messagesService.markPermanentlyFailed(claimed.id, 'ticket user missing', claimToken);
       return;
     }
     if (user.is_blocked) {
-      await this.messagesService.markPermanentlyFailed(claimed.id, 'user blocked the bot');
+      await this.messagesService.markPermanentlyFailed(claimed.id, 'user blocked the bot', claimToken);
       return;
     }
 
@@ -83,7 +98,7 @@ export class OutboxDispatcherService implements OnModuleInit {
     // Every chunk was delivered but the process died before markSent — finish
     // the bookkeeping without a single new Telegram call.
     if (sentChunks >= chunks.length) {
-      await this.messagesService.markSent(claimed.id, storedFirstId);
+      await this.messagesService.markSent(claimed.id, storedFirstId, claimToken);
       return;
     }
 
@@ -93,29 +108,43 @@ export class OutboxDispatcherService implements OnModuleInit {
         const res = await this.gateway.sendMessage({ chat_id: chatId, text: chunks[i] });
         firstMessageId ??= res.message_id; // first chunk's id anchors the reply
         // durable progress: a crash right after this line resumes at i + 1
-        await this.messagesService.recordChunkSent(claimed.id, i + 1, firstMessageId);
+        const stillOwner = await this.messagesService.recordChunkSent(
+          claimed.id,
+          i + 1,
+          firstMessageId,
+          claimToken,
+        );
+        if (!stillOwner) {
+          // FENCING (review fix): our lease expired and another worker re-claimed
+          // the message mid-send. Stop immediately — the new owner continues
+          // from the durable per-chunk progress; continuing would race it.
+          this.logger.warn(
+            `lost the delivery claim for message ${claimed.id} after chunk ${i + 1} — aborting (new owner took over)`,
+          );
+          return;
+        }
       }
-      await this.messagesService.markSent(claimed.id, firstMessageId);
+      await this.messagesService.markSent(claimed.id, firstMessageId, claimToken);
     } catch (e) {
       if (e instanceof TelegramApiError) {
         if (e.code === 403) {
           // user blocked the bot — never retry, flag the user (seed users take this path too)
           await this.usersService.setBlocked(user.id, true);
-          await this.messagesService.markPermanentlyFailed(claimed.id, e.message);
+          await this.messagesService.markPermanentlyFailed(claimed.id, e.message, claimToken);
           return;
         }
         if (e.permanent) {
-          await this.messagesService.markPermanentlyFailed(claimed.id, e.message);
+          await this.messagesService.markPermanentlyFailed(claimed.id, e.message, claimToken);
           return;
         }
         if (e.retryAfterSeconds && e.retryAfterSeconds > 0) {
-          await this.messagesService.deferRetry(claimed.id, e.retryAfterSeconds);
+          await this.messagesService.deferRetry(claimed.id, e.retryAfterSeconds, claimToken);
           return;
         }
-        await this.messagesService.markFailed(claimed.id, e.message);
+        await this.messagesService.markFailed(claimed.id, e.message, claimToken);
         return;
       }
-      await this.messagesService.markFailed(claimed.id, (e as Error).message);
+      await this.messagesService.markFailed(claimed.id, (e as Error).message, claimToken);
     }
   }
 }

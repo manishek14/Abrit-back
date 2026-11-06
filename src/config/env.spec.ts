@@ -48,11 +48,64 @@ describe('parseEnv (security rules)', () => {
         baseEnv({
           NODE_ENV: 'production',
           JWT_SECRET: 'openssl-rand-hex-32-abcdefghijklmnopqrstuvwxyz',
-          ADMIN_PASSWORD: 'a-strong-unique-production-password',
+          ADMIN_PASSWORD: 'a-strong-unique-production-password-42',
           SEED_DEMO_DATA: 'false',
         }),
       );
       expect(env.NODE_ENV).toBe('production');
+    });
+  });
+
+  describe('JWT_SECRET blank & weak-pattern rejection (review fix — length rules now run on the TRIMMED value)', () => {
+    it('rejects a whitespace-only secret in development (length is measured after trim)', () => {
+      expect(() => parseEnv(baseEnv({ NODE_ENV: 'development', JWT_SECRET: '   ' }))).toThrow(
+        /JWT_SECRET/,
+      );
+    });
+
+    it('rejects 32 SPACES in production — previously they passed the raw-length check', () => {
+      expect(() =>
+        parseEnv(
+          baseEnv({
+            NODE_ENV: 'production',
+            JWT_SECRET: ' '.repeat(32),
+            ADMIN_PASSWORD: 'a-strong-unique-production-password-42',
+            SEED_DEMO_DATA: 'false',
+          }),
+        ),
+      ).toThrow(/JWT_SECRET/);
+    });
+
+    it('rejects a single repeated character (a × 32) in production', () => {
+      expect(() =>
+        parseEnv(
+          baseEnv({
+            NODE_ENV: 'production',
+            JWT_SECRET: 'a'.repeat(32),
+            ADMIN_PASSWORD: 'a-strong-unique-production-password-42',
+            SEED_DEMO_DATA: 'false',
+          }),
+        ),
+      ).toThrow(/repeated pattern|JWT_SECRET/);
+    });
+
+    it('rejects a short block repeated to pad the length (abcd1234 × 4) in production', () => {
+      expect(() =>
+        parseEnv(
+          baseEnv({
+            NODE_ENV: 'production',
+            JWT_SECRET: 'abcd1234'.repeat(4),
+            ADMIN_PASSWORD: 'a-strong-unique-production-password-42',
+            SEED_DEMO_DATA: 'false',
+          }),
+        ),
+      ).toThrow(/JWT_SECRET/);
+    });
+
+    it('rejects a trimmed-too-short secret even when the RAW length would pass (dev: 16 spaces + secret)', () => {
+      expect(() =>
+        parseEnv(baseEnv({ NODE_ENV: 'development', JWT_SECRET: '  shortsecret  ' })),
+      ).toThrow(/JWT_SECRET/);
     });
   });
 
@@ -95,6 +148,42 @@ describe('parseEnv (security rules)', () => {
         }),
       );
       expect(env.ADMIN_PASSWORD).toBe('correct-horse-battery-staple-42');
+    });
+
+    it('production: 12 SPACES are refused — previously they passed the raw-length check', () => {
+      expect(() =>
+        parseEnv(
+          baseEnv({
+            NODE_ENV: 'production',
+            ADMIN_PASSWORD: ' '.repeat(12),
+            SEED_DEMO_DATA: 'false',
+          }),
+        ),
+      ).toThrow(/ADMIN_PASSWORD/);
+    });
+
+    it('production: a repeated-character password is refused (low entropy)', () => {
+      expect(() =>
+        parseEnv(
+          baseEnv({
+            NODE_ENV: 'production',
+            ADMIN_PASSWORD: 'a'.repeat(12),
+            SEED_DEMO_DATA: 'false',
+          }),
+        ),
+      ).toThrow(/ADMIN_PASSWORD/);
+    });
+
+    it('production: a 2-character-class password is refused (strength needs ≥ 3 classes)', () => {
+      expect(() =>
+        parseEnv(
+          baseEnv({
+            NODE_ENV: 'production',
+            ADMIN_PASSWORD: 'onlylowercase123',
+            SEED_DEMO_DATA: 'false',
+          }),
+        ),
+      ).toThrow(/ADMIN_PASSWORD/);
     });
   });
 

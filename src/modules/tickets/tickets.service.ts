@@ -25,6 +25,13 @@ export interface ChangeStatusResult {
 export interface EnsureActiveTicketResult {
   ticket: Ticket;
   created: boolean;
+  /**
+   * The ticket-creation announcement, stored IN THE SAME transaction as the
+   * ticket itself (review fix — crash window closed): a crash between the two
+   * inserts is impossible, so a retry can never find a ticket whose opening
+   * SYSTEM message went missing. Null when the ticket already existed.
+   */
+  announcement: Message | null;
 }
 
 @Injectable()
@@ -56,25 +63,57 @@ export class TicketsService {
    * Race-safe: two concurrent requests both try INSERT; the partial unique index
    * rejects the loser, which then re-reads the winner's ticket.
    * (subject = first 60 chars of the triggering message.)
+   *
+   * ATOMIC CREATION ANNOUNCEMENT (review fix): when `opts.announce` is given,
+   * the SYSTEM outbox message is written in the SAME transaction as the
+   * ticket — previously the two were separate writes, and a hard crash
+   * between them left a ticket whose opening announcement never existed (the
+   * retry saw `created = false` and never re-announced). Events fire only
+   * after the commit, per the message-creation contract.
    */
   async ensureActiveTicket(
     user_id: string,
     subject: string | null,
+    opts: { announce?: (ticketNumber: string) => string } = {},
   ): Promise<EnsureActiveTicketResult> {
     const existing = await this.findActiveTicket(user_id);
-    if (existing) return { ticket: existing, created: false };
+    if (existing) return { ticket: existing, created: false, announcement: null };
 
     try {
-      const insertResult = await this.repo.insert({ user_id, subject: subject ?? null });
-      const id = insertResult.identifiers[0]?.id as string;
-      // ticket_number is DB-generated (sequence) → reload to expose it
-      const ticket = await this.repo.findOneByOrFail({ id });
+      // filled inside the transaction, emitted only after it commits
+      let announcement: Message | null = null;
+
+      const ticket = await this.dataSource.transaction(async (manager) => {
+        const insertResult = await manager.insert(Ticket, { user_id, subject: subject ?? null });
+        const id = insertResult.identifiers[0]?.id as string;
+        // ticket_number is DB-generated (sequence) → reload to expose it
+        const created = await manager.findOneByOrFail(Ticket, { id });
+
+        if (opts.announce) {
+          const msgRepo = manager.getRepository(Message);
+          announcement = await msgRepo.save(
+            msgRepo.create({
+              ticket_id: id,
+              role: MessageRole.SYSTEM,
+              content: opts.announce(created.ticket_number),
+              delivery_status: DeliveryStatus.PENDING,
+            }),
+          );
+          // the announcement is a message — the list's sort key must move too
+          const now = new Date();
+          await manager.update(Ticket, id, { last_message_at: now });
+          created.last_message_at = now;
+        }
+        return created;
+      });
+
       this.events.emit('ticket.created', { ticket });
-      return { ticket, created: true };
+      if (announcement) this.events.emit('message.created', { message: announcement });
+      return { ticket, created: true, announcement };
     } catch (e) {
       if (isUniqueViolation(e)) {
         const winner = await this.findActiveTicket(user_id);
-        if (winner) return { ticket: winner, created: false };
+        if (winner) return { ticket: winner, created: false, announcement: null };
       }
       throw e;
     }

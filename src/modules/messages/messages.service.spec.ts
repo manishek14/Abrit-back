@@ -251,6 +251,7 @@ describe('MessagesService', () => {
       const original = mkMessage({
         id: 'm-first',
         role: MessageRole.ADMIN,
+        content: 'پاسخ تکراری',
         admin_id: 'a-1',
         client_message_id: 'key-12345678',
         delivery_status: DeliveryStatus.PENDING,
@@ -259,7 +260,7 @@ describe('MessagesService', () => {
 
       const result = await service.addAdminMessage({
         ticket_id: 't-1',
-        content: 'پاسخ تکراری',
+        content: 'پاسخ تکراری', // SAME content — the key is bound to it
         admin_id: 'a-1',
         client_message_id: 'key-12345678',
       });
@@ -272,10 +273,36 @@ describe('MessagesService', () => {
       expect(events.emit).toHaveBeenCalledWith('message.created', { message: original });
     });
 
+    it('IDEMPOTENCY (review fix — content-bound): the SAME key with DIFFERENT content is a 409, NOT a replay', async () => {
+      // Without this guard a retry with an edited draft would answer with the
+      // OLD message and the panel would wipe text that was never sent.
+      const original = mkMessage({
+        id: 'm-first',
+        role: MessageRole.ADMIN,
+        content: 'پاسخ اول',
+        client_message_id: 'key-12345678',
+        delivery_status: DeliveryStatus.PENDING,
+      });
+      repo.findOne.mockResolvedValueOnce(original);
+
+      await expect(
+        service.addAdminMessage({
+          ticket_id: 't-1',
+          content: 'پاسخ ویرایش‌شده', // EDITED body, REUSED key
+          admin_id: 'a-1',
+          client_message_id: 'key-12345678',
+        }),
+      ).rejects.toThrow(ConflictException);
+
+      expect(manager.save).not.toHaveBeenCalled(); // nothing stored
+      expect(events.emit).not.toHaveBeenCalled(); // no event, no delivery
+    });
+
     it('IDEMPOTENCY: loses a concurrent same-key race → the winner’s message is returned', async () => {
       const winner = mkMessage({
         id: 'm-winner',
         role: MessageRole.ADMIN,
+        content: 'پاسخ',
         client_message_id: 'key-12345678',
       });
       repo.findOne // pre-check misses
@@ -285,7 +312,7 @@ describe('MessagesService', () => {
 
       const result = await service.addAdminMessage({
         ticket_id: 't-1',
-        content: 'پاسخ',
+        content: 'پاسخ', // identical content — the loser replays the winner
         admin_id: 'a-1',
         client_message_id: 'key-12345678',
       });
@@ -293,19 +320,49 @@ describe('MessagesService', () => {
       expect(result.message).toBe(winner);
       expect(result.replayed).toBe(true);
     });
+
+    it('IDEMPOTENCY (content-bound): the race loser with DIFFERENT content gets a 409 too', async () => {
+      const winner = mkMessage({
+        id: 'm-winner',
+        role: MessageRole.ADMIN,
+        content: 'پاسخ اولیه',
+        client_message_id: 'key-12345678',
+      });
+      repo.findOne
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(winner);
+      manager.save.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: '23505' }));
+
+      await expect(
+        service.addAdminMessage({
+          ticket_id: 't-1',
+          content: 'متن دیگری',
+          admin_id: 'a-1',
+          client_message_id: 'key-12345678',
+        }),
+      ).rejects.toThrow(ConflictException);
+    });
   });
 
   describe('multi-chunk delivery progress (review fix — no duplicated parts)', () => {
-    it('recordChunkSent atomically merges sent_chunks + the first chunk id into meta', async () => {
-      repo.query.mockResolvedValueOnce([]);
+    it('recordChunkSent merges progress into meta and is FENCED by the claim token', async () => {
+      repo.query.mockResolvedValueOnce([{ id: 'm-1' }]);
 
-      await service.recordChunkSent('m-1', 2, '77');
+      const owned = await service.recordChunkSent('m-1', 2, '77', 'tok-1');
 
+      expect(owned).toBe(true);
       const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain("'sent_chunks'");
       expect(sql).toContain("'first_telegram_message_id'");
       expect(sql).toContain('COALESCE($3::text, meta'); // merge, not overwrite
-      expect(params).toEqual(['m-1', 2, '77']);
+      expect(sql).toContain("claim_token"); // FENCING (review fix)
+      expect(params).toEqual(['m-1', 2, '77', 'tok-1']);
+    });
+
+    it('recordChunkSent returns false when the claim was lost (0 rows) — the caller must abort', async () => {
+      repo.query.mockResolvedValueOnce([]);
+
+      expect(await service.recordChunkSent('m-1', 2, '77', 'tok-stale')).toBe(false);
     });
 
     it('readChunkProgress tolerates missing/invalid meta and keeps the stored first id', () => {
@@ -322,10 +379,17 @@ describe('MessagesService', () => {
         MessagesService.readChunkProgress(mkMessage({ meta: { sent_chunks: -3 } })),
       ).toEqual({ sentChunks: 0, firstTelegramMessageId: null });
     });
+
+    it('readClaimToken surfaces the fencing token (review fix)', () => {
+      expect(MessagesService.readClaimToken(mkMessage({ meta: { claim_token: 'tok-9' } }))).toBe(
+        'tok-9',
+      );
+      expect(MessagesService.readClaimToken(mkMessage())).toBe('');
+    });
   });
 
   describe('claimForDelivery (atomic outbox claim — review fix #2)', () => {
-    it('returns the claimed row when the atomic UPDATE wins', async () => {
+    it('returns the claimed row when the atomic UPDATE wins — attempts consumed + token stamped', async () => {
       const claimed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.PENDING });
       repo.query.mockResolvedValueOnce([claimed]);
 
@@ -334,10 +398,16 @@ describe('MessagesService', () => {
       expect(result).toBe(claimed);
       const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain('SET claimed_at = now()');
+      // CRASH-SAFE ATTEMPT COUNTING (review fix): the counter is consumed at
+      // claim time — a hard crash right after the claim burns one retry.
+      expect(sql).toContain('delivery_attempts = delivery_attempts + 1');
+      // CLAIM TOKEN (review fix): a fresh fencing token is stamped into meta
+      expect(sql).toContain("'claim_token'");
       expect(sql).toContain("delivery_status IN ('PENDING', 'FAILED')");
       expect(sql).toContain('claimed_at IS NULL OR claimed_at <');
       expect(params[0]).toBe('m-1');
       expect(params[1]).toBe(5); // MAX_DELIVERY_ATTEMPTS
+      expect(params[3]).toEqual(expect.stringMatching(/[0-9a-f-]{36}/)); // uuid token
     });
 
     it('returns null when another sender owns the claim (0 rows)', async () => {
@@ -419,39 +489,41 @@ describe('MessagesService', () => {
     });
   });
 
-  describe('outbox state transitions', () => {
-    it('markSent sets SENT with the telegram message id and emits update', async () => {
-      repo.findOneByOrFail.mockResolvedValue(mkMessage({ delivery_status: DeliveryStatus.SENT }));
+  describe('outbox state transitions (all FENCED by the claim token — review fix)', () => {
+    it('markSent sets SENT with the telegram message id, fenced by the token, and emits update', async () => {
+      const sent = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.SENT });
+      repo.query.mockResolvedValueOnce([sent]);
 
-      await service.markSent('m-1', '77');
+      const result = await service.markSent('m-1', '77', 'tok-1');
 
-      expect(repo.update).toHaveBeenCalledWith(
-        { id: 'm-1' },
-        expect.objectContaining({
-          delivery_status: DeliveryStatus.SENT,
-          telegram_message_id: '77',
-          sent_at: expect.any(Date),
-          error: null,
-        }),
-      );
-      expect(events.emit).toHaveBeenCalledWith('message.updated', expect.anything());
+      expect(result).toBe(sent);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain("delivery_status = 'SENT'");
+      expect(sql).toContain("claim_token"); // fencing
+      expect(params).toEqual(['m-1', '77', 'tok-1']);
+      expect(events.emit).toHaveBeenCalledWith('message.updated', { message: sent });
     });
 
-    it('markFailed sets FAILED and increments attempts', async () => {
-      repo.findOneByOrFail.mockResolvedValue(
-        mkMessage({ delivery_status: DeliveryStatus.FAILED, delivery_attempts: 2 }),
-      );
+    it('markSent writes NOTHING when the claim was lost (0 rows, no event)', async () => {
+      repo.query.mockResolvedValueOnce([]);
 
-      await service.markFailed('m-1', 'telegram is down');
+      expect(await service.markSent('m-1', '77', 'tok-stale')).toBeNull();
+      expect(events.emit).not.toHaveBeenCalled();
+    });
 
-      expect(repo.update).toHaveBeenCalledWith(
-        { id: 'm-1' },
-        expect.objectContaining({
-          delivery_status: DeliveryStatus.FAILED,
-          error: 'telegram is down',
-          delivery_attempts: 3,
-        }),
-      );
+    it('markFailed records the outcome but does NOT double-count the attempt (claim owns the counter)', async () => {
+      const failed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.FAILED });
+      repo.query.mockResolvedValueOnce([failed]);
+
+      const result = await service.markFailed('m-1', 'telegram is down', 'tok-1');
+
+      expect(result).toBe(failed);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain("delivery_status = 'FAILED'");
+      expect(sql).toContain('LEFT($2::text, 500)');
+      expect(sql).not.toContain('delivery_attempts ='); // consumed at claim time (review fix)
+      expect(params).toEqual(['m-1', 'telegram is down', 'tok-1']);
+      expect(events.emit).toHaveBeenCalledWith('message.updated', { message: failed });
     });
   });
 
@@ -480,33 +552,34 @@ describe('MessagesService', () => {
 
   describe('permanent failure & rate-limit deferral', () => {
     it('markPermanentlyFailed caps attempts so the sweeper never retries again', async () => {
-      repo.findOneByOrFail.mockResolvedValue(mkMessage());
+      const failed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.FAILED });
+      repo.query.mockResolvedValueOnce([failed]);
 
-      await service.markPermanentlyFailed('m-1', 'user blocked the bot');
+      const result = await service.markPermanentlyFailed('m-1', 'user blocked the bot', 'tok-1');
 
-      expect(repo.update).toHaveBeenCalledWith(
-        { id: 'm-1' },
-        expect.objectContaining({ delivery_status: DeliveryStatus.FAILED, delivery_attempts: 5 }),
-      );
-      expect(events.emit).toHaveBeenCalledWith('message.updated', expect.anything());
+      expect(result).toBe(failed);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('delivery_attempts = $4');
+      expect(params[3]).toBe(5); // MAX_DELIVERY_ATTEMPTS
+      expect(sql).toContain('claim_token'); // fencing
+      expect(events.emit).toHaveBeenCalledWith('message.updated', { message: failed });
     });
 
-    it('deferRetry parks a 429 message with retry_after_until in meta', async () => {
-      repo.findOneByOrFail.mockResolvedValue(mkMessage({ meta: { model: 'x' } }));
+    it('deferRetry parks a 429 message with retry_after_until merged into meta (token-fenced)', async () => {
+      const parked = mkMessage({ id: 'm-1', meta: { model: 'x' } });
+      repo.query.mockResolvedValueOnce([parked]);
 
-      await service.deferRetry('m-1', 30);
+      const result = await service.deferRetry('m-1', 30, 'tok-1');
 
-      expect(repo.update).toHaveBeenCalledWith(
-        { id: 'm-1' },
-        expect.objectContaining({
-          delivery_status: DeliveryStatus.FAILED,
-          delivery_attempts: 1,
-          meta: expect.objectContaining({
-            model: 'x',
-            retry_after_until: expect.any(String),
-          }),
-        }),
-      );
+      expect(result).toBe(parked);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain("'retry_after_until'");
+      expect(sql).toContain('COALESCE(meta'); // meta MERGE — model/claim_token survive
+      expect(params[0]).toBe('m-1');
+      expect(params[1]).toContain('retry after 30s');
+      expect(params[2]).toBe('tok-1');
+      expect(params[3]).toEqual(expect.any(String)); // ISO timestamp
+      expect(events.emit).toHaveBeenCalledWith('message.updated', { message: parked });
     });
   });
 });

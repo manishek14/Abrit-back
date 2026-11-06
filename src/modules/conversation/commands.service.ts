@@ -1,8 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
-import { MessageRole, TicketStatus } from '../../database/enums';
+import { TicketStatus } from '../../database/enums';
 import { TICKET_STATUS_LABELS } from '../../common/ticket-labels';
-import { MessagesService } from '../messages/messages.service';
 import { TicketsService } from '../tickets/tickets.service';
 import { sendEphemeral, TELEGRAM_GATEWAY, TelegramGateway } from '../telegram/telegram-gateway.interface';
 
@@ -45,7 +44,6 @@ export class CommandsService {
 
   constructor(
     private readonly ticketsService: TicketsService,
-    private readonly messagesService: MessagesService,
     @Inject(TELEGRAM_GATEWAY) private readonly gateway: TelegramGateway,
   ) {}
 
@@ -67,15 +65,14 @@ export class CommandsService {
   }
 
   private async handleNew(user: TelegramUser, chatId: string): Promise<void> {
-    const { ticket, created } = await this.ticketsService.ensureActiveTicket(user.id, null);
-    if (created) {
-      // durable announcement — flows through the outbox like every ticket event
-      await this.messagesService.addOutboundMessage({
-        ticket_id: ticket.id,
-        role: MessageRole.SYSTEM,
-        content: `تیکت ${ticket.ticket_number} ایجاد شد.\nلطفاً شرح مشکل خود را بنویسید.`,
-      });
-    } else {
+    const { ticket, created } = await this.ticketsService.ensureActiveTicket(user.id, null, {
+      // ATOMIC ANNOUNCEMENT (review fix): the durable /new announcement is
+      // stored IN the ticket-creation transaction — a crash between the two
+      // inserts is impossible, so the opening message can never go missing.
+      announce: (ticketNumber) =>
+        `تیکت ${ticketNumber} ایجاد شد.\nلطفاً شرح مشکل خود را بنویسید.`,
+    });
+    if (!created) {
       await sendEphemeral(
         this.gateway,
         chatId,

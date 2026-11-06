@@ -56,7 +56,9 @@ describe('OutboxDispatcherService', () => {
       markFailed: jest.fn(),
       markPermanentlyFailed: jest.fn(),
       deferRetry: jest.fn(),
-      recordChunkSent: jest.fn(),
+      // the fenced progress write succeeds by default (review fix: the
+      // dispatcher now checks ownership on every chunk)
+      recordChunkSent: jest.fn().mockResolvedValue(true),
     };
     tickets = { findById: jest.fn() };
     users = { findByIdOrNull: jest.fn(), setBlocked: jest.fn() };
@@ -83,8 +85,8 @@ describe('OutboxDispatcherService', () => {
     expect(messages.markPermanentlyFailed).not.toHaveBeenCalled();
   });
 
-  it('wins the claim → sends the (fresh) claimed row and marks it SENT', async () => {
-    const claimed = mkMessage({ id: 'm-9', content: 'متن جدید' });
+  it('wins the claim → sends the (fresh) claimed row and marks it SENT (token-fenced writes)', async () => {
+    const claimed = mkMessage({ id: 'm-9', content: 'متن جدید', meta: { claim_token: 'tok-9' } });
     messages.claimForDelivery.mockResolvedValueOnce(claimed);
     tickets.findById.mockResolvedValueOnce(mkTicket());
     users.findByIdOrNull.mockResolvedValueOnce(mkUser());
@@ -93,11 +95,11 @@ describe('OutboxDispatcherService', () => {
 
     expect(messages.claimForDelivery).toHaveBeenCalledWith('m-stale');
     expect(gateway.sendMessage).toHaveBeenCalledWith({ chat_id: '555', text: 'متن جدید' });
-    expect(messages.markSent).toHaveBeenCalledWith('m-9', '77');
+    expect(messages.markSent).toHaveBeenCalledWith('m-9', '77', 'tok-9'); // FENCED by the claim token
   });
 
   it('403 from Telegram → block the user and never retry', async () => {
-    messages.claimForDelivery.mockResolvedValueOnce(mkMessage());
+    messages.claimForDelivery.mockResolvedValueOnce(mkMessage({ meta: { claim_token: 'tok-1' } }));
     tickets.findById.mockResolvedValueOnce(mkTicket());
     users.findByIdOrNull.mockResolvedValueOnce(mkUser());
     gateway.sendMessage.mockRejectedValueOnce(new TelegramApiError('blocked', 403, false));
@@ -105,19 +107,19 @@ describe('OutboxDispatcherService', () => {
     await service.deliver(mkMessage());
 
     expect(users.setBlocked).toHaveBeenCalledWith('u-1', true);
-    expect(messages.markPermanentlyFailed).toHaveBeenCalledWith('m-1', 'blocked');
+    expect(messages.markPermanentlyFailed).toHaveBeenCalledWith('m-1', 'blocked', 'tok-1');
     expect(messages.markSent).not.toHaveBeenCalled();
   });
 
   it('retryable error → markFailed (sweeper retries later)', async () => {
-    messages.claimForDelivery.mockResolvedValueOnce(mkMessage());
+    messages.claimForDelivery.mockResolvedValueOnce(mkMessage({ meta: { claim_token: 'tok-1' } }));
     tickets.findById.mockResolvedValueOnce(mkTicket());
     users.findByIdOrNull.mockResolvedValueOnce(mkUser());
     gateway.sendMessage.mockRejectedValueOnce(new Error('network down'));
 
     await service.deliver(mkMessage());
 
-    expect(messages.markFailed).toHaveBeenCalledWith('m-1', 'network down');
+    expect(messages.markFailed).toHaveBeenCalledWith('m-1', 'network down', 'tok-1');
   });
 
   it('onModuleInit: only outbound PENDING messages are picked from message.created', () => {
@@ -141,7 +143,9 @@ describe('OutboxDispatcherService', () => {
 
     it('records durable progress after EVERY chunk and keeps the first chunk’s id', async () => {
       expect(chunks().length).toBe(3);
-      messages.claimForDelivery.mockResolvedValueOnce(mkMessage({ id: 'm-long', content: longText }));
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({ id: 'm-long', content: longText, meta: { claim_token: 'tok-1' } }),
+      );
       tickets.findById.mockResolvedValueOnce(mkTicket());
       users.findByIdOrNull.mockResolvedValueOnce(mkUser());
       gateway.sendMessage
@@ -152,15 +156,17 @@ describe('OutboxDispatcherService', () => {
       await service.deliver(mkMessage({ id: 'm-long', content: longText }));
 
       expect(gateway.sendMessage).toHaveBeenCalledTimes(3);
-      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(1, 'm-long', 1, '77');
-      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(2, 'm-long', 2, '77');
-      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(3, 'm-long', 3, '77');
-      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77'); // first chunk anchors the reply
+      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(1, 'm-long', 1, '77', 'tok-1');
+      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(2, 'm-long', 2, '77', 'tok-1');
+      expect(messages.recordChunkSent).toHaveBeenNthCalledWith(3, 'm-long', 3, '77', 'tok-1');
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77', 'tok-1'); // first chunk anchors the reply
     });
 
     it('chunk 2 fails → progress (1) is kept; the retry sends ONLY chunks 2 and 3', async () => {
       // FIRST attempt: chunk 1 delivered, chunk 2 throws
-      messages.claimForDelivery.mockResolvedValueOnce(mkMessage({ id: 'm-long', content: longText }));
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({ id: 'm-long', content: longText, meta: { claim_token: 'tok-1' } }),
+      );
       tickets.findById.mockResolvedValueOnce(mkTicket());
       users.findByIdOrNull.mockResolvedValueOnce(mkUser());
       gateway.sendMessage
@@ -169,8 +175,8 @@ describe('OutboxDispatcherService', () => {
 
       await service.deliver(mkMessage({ id: 'm-long', content: longText }));
 
-      expect(messages.recordChunkSent).toHaveBeenCalledWith('m-long', 1, '77'); // progress persisted
-      expect(messages.markFailed).toHaveBeenCalledWith('m-long', 'network down');
+      expect(messages.recordChunkSent).toHaveBeenCalledWith('m-long', 1, '77', 'tok-1'); // progress persisted
+      expect(messages.markFailed).toHaveBeenCalledWith('m-long', 'network down', 'tok-1');
       expect(messages.markSent).not.toHaveBeenCalled();
 
       // RETRY (sweeper): the claimed row carries meta.sent_chunks = 1 → resume
@@ -178,7 +184,7 @@ describe('OutboxDispatcherService', () => {
         mkMessage({
           id: 'm-long',
           content: longText,
-          meta: { sent_chunks: 1, first_telegram_message_id: '77' },
+          meta: { sent_chunks: 1, first_telegram_message_id: '77', claim_token: 'tok-2' },
         }),
       );
       tickets.findById.mockResolvedValueOnce(mkTicket());
@@ -194,8 +200,8 @@ describe('OutboxDispatcherService', () => {
       expect(gateway.sendMessage).toHaveBeenCalledTimes(2);
       expect(gateway.sendMessage).toHaveBeenNthCalledWith(1, { chat_id: '555', text: chunks()[1] });
       expect(gateway.sendMessage).toHaveBeenNthCalledWith(2, { chat_id: '555', text: chunks()[2] });
-      expect(messages.recordChunkSent).toHaveBeenLastCalledWith('m-long', 3, '77');
-      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77'); // stored first id survives
+      expect(messages.recordChunkSent).toHaveBeenLastCalledWith('m-long', 3, '77', 'tok-2');
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77', 'tok-2'); // stored first id survives
     });
 
     it('every chunk already delivered but markSent crashed → finish bookkeeping WITHOUT any Telegram call', async () => {
@@ -203,7 +209,7 @@ describe('OutboxDispatcherService', () => {
         mkMessage({
           id: 'm-long',
           content: longText,
-          meta: { sent_chunks: 3, first_telegram_message_id: '77' },
+          meta: { sent_chunks: 3, first_telegram_message_id: '77', claim_token: 'tok-1' },
         }),
       );
       tickets.findById.mockResolvedValueOnce(mkTicket());
@@ -212,7 +218,64 @@ describe('OutboxDispatcherService', () => {
       await service.deliver(mkMessage({ id: 'm-long', content: longText }));
 
       expect(gateway.sendMessage).not.toHaveBeenCalled(); // nothing re-sent
-      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77');
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '77', 'tok-1');
+    });
+
+    it('FENCING (review fix): losing the claim mid-send ABORTS the remaining chunks', async () => {
+      // our 60 s lease expires mid-send (slow multi-chunk delivery) and another
+      // worker re-claims — our progress write matches 0 rows (false) → abort
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({ id: 'm-long', content: longText, meta: { claim_token: 'tok-zombie' } }),
+      );
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+      gateway.sendMessage.mockResolvedValue({ message_id: '77' });
+      messages.recordChunkSent.mockResolvedValueOnce(true).mockResolvedValueOnce(false); // chunk 1 ok, chunk 2 → fence lost
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      // chunk 1 + chunk 2 were sent, the fence broke AFTER chunk 2's progress
+      // write → chunk 3 is NOT sent by us (the new owner owns the rest)
+      expect(gateway.sendMessage).toHaveBeenCalledTimes(2);
+      expect(messages.markSent).not.toHaveBeenCalled(); // we no longer own the terminal write
+      expect(messages.markFailed).not.toHaveBeenCalled(); // and we don't clobber the new owner either
+    });
+
+    it('HONEST AT-LEAST-ONCE (documented residual window): a crash between a chunk’s Telegram send and its progress commit re-sends that chunk once on the retry', async () => {
+      // attempt 1: chunk 1 DELIVERED to Telegram, then the process dies before
+      // recordChunkSent can commit (simulated by the write throwing)
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({ id: 'm-long', content: longText, meta: { claim_token: 'tok-1' } }),
+      );
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+      gateway.sendMessage.mockResolvedValueOnce({ message_id: '77' });
+      messages.recordChunkSent.mockRejectedValueOnce(new Error('hard crash'));
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      expect(messages.markFailed).toHaveBeenCalledWith('m-long', 'hard crash', 'tok-1');
+
+      // attempt 2 (sweeper): meta has NO sent_chunks (the crash lost it) → the
+      // retry starts at chunk 1 again — chunk 1 reaches the user twice. That is
+      // EXACTLY the documented at-least-once window; claiming less would be
+      // dishonest (it is why progress is committed after EVERY chunk).
+      messages.claimForDelivery.mockResolvedValueOnce(
+        mkMessage({ id: 'm-long', content: longText, meta: { claim_token: 'tok-2' } }),
+      );
+      tickets.findById.mockResolvedValueOnce(mkTicket());
+      users.findByIdOrNull.mockResolvedValueOnce(mkUser());
+      gateway.sendMessage.mockClear();
+      gateway.sendMessage
+        .mockResolvedValueOnce({ message_id: '80' })
+        .mockResolvedValueOnce({ message_id: '81' })
+        .mockResolvedValueOnce({ message_id: '82' });
+
+      await service.deliver(mkMessage({ id: 'm-long', content: longText }));
+
+      expect(gateway.sendMessage).toHaveBeenCalledTimes(3); // all three chunks again
+      expect(gateway.sendMessage).toHaveBeenNthCalledWith(1, { chat_id: '555', text: chunks()[0] }); // re-sent — documented
+      expect(messages.markSent).toHaveBeenCalledWith('m-long', '80', 'tok-2');
     });
   });
 

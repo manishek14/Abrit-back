@@ -461,8 +461,12 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     // someone else owns a FRESH claim → the sweeper must skip it entirely
     await app.get(SweeperService).sweep('cron');
     expect(fakeGateway.sent.filter((s) => s.text === 'پیام با قفل')).toHaveLength(0);
-    const [row] = await ds.query(`SELECT delivery_status FROM messages WHERE id = $1`, [msg.id]);
+    const [row] = await ds.query(
+      `SELECT delivery_status, delivery_attempts FROM messages WHERE id = $1`,
+      [msg.id],
+    );
     expect(row.delivery_status).toBe('PENDING');
+    expect(row.delivery_attempts).toBe(0); // a LOST claim consumes no attempt
 
     // the claimant crashed — after the lease expires the sweeper reclaims it
     await ds.query(`UPDATE messages SET claimed_at = now() - interval '2 minutes' WHERE id = $1`, [msg.id]);
@@ -472,6 +476,13 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
       return r.delivery_status === 'SENT';
     });
     expect(fakeGateway.sent.filter((s) => s.text === 'پیام با قفل')).toHaveLength(1);
+    const [reclaimed] = await ds.query(
+      `SELECT delivery_attempts FROM messages WHERE id = $1`,
+      [msg.id],
+    );
+    // CRASH-SAFE ATTEMPT COUNTING (review fix): the crashed sender's stale
+    // claim still consumed ONE of the MAX_DELIVERY_ATTEMPTS retries.
+    expect(reclaimed.delivery_attempts).toBe(1);
   });
 
   it('STATUS #4-a: CLOSED → IN_PROGRESS with another active ticket → 409, never a 500', async () => {
@@ -719,6 +730,149 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
         .post(`/api/tickets/${ticket.id}/messages`)
         .send({ content: 'پاسخ', client_message_id: 'short!' }),
     ).expect(400);
+  });
+
+  it('ADMIN REPLY IDEMPOTENCY (content-bound): the SAME key with DIFFERENT content is a 409, never a replay', async () => {
+    await postUpdate(messageUpdate(950802, 'سلام، ویرایش پاسخ'));
+    await assistantSent(1);
+    const [ticket] = await ds.query(`SELECT id FROM tickets`);
+
+    const first = await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: 'پاسخ اول', client_message_id: 'e2e-idem-key-0002' }),
+    ).expect(201);
+
+    // the operator EDITED the draft but (bug/stale tab) reused the old key:
+    // answering with the original message would wipe text that was never sent
+    await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: 'پاسخ ویرایش‌شده', client_message_id: 'e2e-idem-key-0002' }),
+    ).expect(409);
+
+    // nothing new was stored and the original row is intact
+    expect(await count('messages', `role = 'ADMIN'`)).toBe(1);
+    const [stored] = await ds.query(`SELECT content FROM messages WHERE role = 'ADMIN'`);
+    expect(stored.content).toBe('پاسخ اول');
+
+    // the honest path works: an edited draft with a FRESH key is a new message
+    const edited = await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages`)
+        .send({ content: 'پاسخ ویرایش‌شده', client_message_id: 'e2e-idem-key-0003' }),
+    ).expect(201);
+    expect(edited.body.data.id).not.toBe(first.body.data.id);
+    expect(await count('messages', `role = 'ADMIN'`)).toBe(2);
+  });
+
+  it('ORDERING GATE (review fix): a later message of the same chat waits while an earlier one is unfinished', async () => {
+    await postUpdate(messageUpdate(950810, 'پیام اول'));
+    await assistantSent(1);
+
+    // simulate a crash AFTER message 1 was stored: its reply is gone and the
+    // row sits in stale PROCESSING — the sweeper will retry it, but until then
+    // it has NOT reached a terminal state
+    await ds.query(`DELETE FROM messages WHERE role = 'ASSISTANT'`);
+    const [firstUpdate] = await ds.query(
+      `SELECT update_id FROM bot_updates ORDER BY update_id ASC LIMIT 1`,
+    );
+    await ds.query(
+      `UPDATE bot_updates SET status = 'PROCESSING', stage = 'USER_SAVED',
+       locked_at = now() - interval '3 minutes' WHERE update_id = $1`,
+      [firstUpdate.update_id],
+    );
+
+    // message 2 arrives — it must NOT overtake the unfinished message 1
+    await postUpdate(messageUpdate(950810, 'پیام دوم'));
+    await new Promise((r) => setTimeout(r, 600)); // let the enqueue path settle
+
+    const [second] = await ds.query(
+      `SELECT status, attempts FROM bot_updates WHERE update_id > $1 ORDER BY update_id ASC LIMIT 1`,
+      [firstUpdate.update_id],
+    );
+    expect(second.status).toBe('RECEIVED'); // waiting — not claimed
+    expect(second.attempts).toBe(0); // and no attempt burned while waiting
+    expect(await count('messages', `role = 'USER'`)).toBe(1); // only message 1 is stored
+    expect(await count('messages', `role = 'ASSISTANT'`)).toBe(0); // its reply is pending the retry
+
+    // the sweeper finishes message 1 FIRST, only then message 2 runs
+    await app.get(SweeperService).sweep('cron');
+    await assistantSent(2);
+
+    const [first] = await ds.query(`SELECT status FROM bot_updates WHERE update_id = $1`, [
+      firstUpdate.update_id,
+    ]);
+    expect(first.status).toBe('DONE');
+    expect(await count('bot_updates', `status = 'DONE'`)).toBe(2);
+
+    // hard proof of no overtaking: the reply to message 1 was stored BEFORE
+    // message 2's user row even existed
+    const [secondUserMsg] = await ds.query(
+      `SELECT id FROM messages WHERE role = 'USER' AND content = 'پیام دوم'`,
+    );
+    const [firstReply] = await ds.query(
+      `SELECT id FROM messages WHERE role = 'ASSISTANT' ORDER BY id ASC LIMIT 1`,
+    );
+    expect(Number(secondUserMsg.id)).toBeGreaterThan(Number(firstReply.id));
+  });
+
+  it('BLOCKED RECOVERY (review fix): a fresh message from a blocked user clears the stale flag and is processed', async () => {
+    // a previous outbound 403 flagged this user — but they have since unblocked
+    // the bot and written again (Telegram only delivers from unblocked chats)
+    await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id, is_blocked)
+       VALUES ('950820', '950820', true)`,
+    );
+
+    await postUpdate(messageUpdate(950820, 'سلام دوباره'));
+    await assistantSent(1);
+
+    const [user] = await ds.query(
+      `SELECT is_blocked FROM telegram_users WHERE telegram_id = '950820'`,
+    );
+    expect(user.is_blocked).toBe(false); // the stale flag healed
+    expect(await count('messages', `role = 'USER'`)).toBe(1);
+    expect(await count('tickets')).toBe(1);
+    const [update] = await ds.query(`SELECT status FROM bot_updates`);
+    expect(update.status).toBe('DONE'); // previously such messages were silently dropped
+    expect(fakeGateway.sent.length).toBeGreaterThanOrEqual(1); // the reply reached the chat
+  });
+
+  it('CRASH RECOVERY (empty-ticket fix): retrying a stored message NEVER opens a second, empty active ticket', async () => {
+    await postUpdate(messageUpdate(950830, 'پیام با کرش در بازبینی'));
+    await assistantSent(1);
+
+    // the operator closes the ORIGINAL ticket during the retry window
+    const [ticket] = await ds.query(`SELECT id FROM tickets`);
+    await authed(
+      request(app.getHttpServer()).patch(`/api/tickets/${ticket.id}/status`).send({ status: 'CLOSED' }),
+    ).expect(200);
+
+    // simulate the crash: the update sits in stale PROCESSING with its user
+    // message already stored (the reply is deleted so the retry has real work)
+    await ds.query(`DELETE FROM messages WHERE role = 'ASSISTANT'`);
+    await ds.query(
+      `UPDATE bot_updates SET status = 'PROCESSING', stage = 'USER_SAVED',
+       locked_at = now() - interval '3 minutes'`,
+    );
+
+    await app.get(SweeperService).sweep('cron');
+    await assistantSent(1);
+
+    // THE assertion: exactly ONE ticket exists — the retry resumed inside the
+    // ORIGINAL (closed) ticket instead of creating a fresh, EMPTY active one
+    expect(await count('tickets')).toBe(1);
+    expect(await count('tickets', `status <> 'CLOSED'`)).toBe(0); // no empty ACTIVE ticket left behind
+    expect(await count('messages', `role = 'USER'`)).toBe(1);
+    expect(await count('messages', `role = 'ASSISTANT'`)).toBe(1);
+
+    // the regenerated reply landed in the ORIGINAL ticket — next to its user message
+    const [reply] = await ds.query(`SELECT ticket_id FROM messages WHERE role = 'ASSISTANT'`);
+    expect(reply.ticket_id).toBe(ticket.id);
+    const [update] = await ds.query(`SELECT status, stage FROM bot_updates`);
+    expect(update.status).toBe('DONE');
+    expect(update.stage).toBe('REPLY_SAVED');
   });
 
   it('CURSOR VALIDATION: out-of-bigint-range and zero cursors are 400s, the bigint max is accepted', async () => {

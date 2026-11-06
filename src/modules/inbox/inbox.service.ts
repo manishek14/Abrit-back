@@ -106,6 +106,31 @@ export class InboxService {
     return (requeued.affected ?? 0) + (failed.affected ?? 0);
   }
 
+  /**
+   * PER-CHAT ORDERING GATE (review fix): does an EARLIER update of the same
+   * chat exist that has not reached a terminal state yet (DONE / FAILED)?
+   *
+   * The in-process promise queue alone breaks order after a processing
+   * failure: the failed update's promise RESOLVES (the error is swallowed),
+   * so the next update would run immediately while the sweeper retries the
+   * first one minutes later — the second reply could reach the user BEFORE
+   * the first. The orchestrator therefore asks this BEFORE claiming: while a
+   * predecessor is unfinished the row is simply left RECEIVED (attempts are
+   * NOT consumed) and the sweeper re-drives it once the blocker is terminal.
+   */
+  async hasEarlierUnfinished(chatId: string, updateId: string): Promise<boolean> {
+    const rows = await this.repo.query(
+      `SELECT 1
+         FROM bot_updates
+        WHERE status NOT IN ('DONE', 'FAILED')
+          AND update_id < $2::bigint
+          AND payload -> 'message' -> 'chat' ->> 'id' = $1
+        LIMIT 1`,
+      [chatId, updateId],
+    );
+    return rows.length > 0;
+  }
+
   async findReceived(limit = 50): Promise<BotUpdate[]> {
     return this.repo.find({
       where: { status: BotUpdateStatus.RECEIVED },

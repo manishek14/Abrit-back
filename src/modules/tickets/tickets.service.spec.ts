@@ -29,7 +29,13 @@ describe('TicketsService', () => {
     update: jest.Mock;
   };
   let events: { emit: jest.Mock };
-  let manager: { findOne: jest.Mock; update: jest.Mock; getRepository: jest.Mock };
+  let manager: {
+    findOne: jest.Mock;
+    findOneByOrFail: jest.Mock;
+    insert: jest.Mock;
+    update: jest.Mock;
+    getRepository: jest.Mock;
+  };
   let dataSource: { transaction: jest.Mock };
 
   beforeEach(() => {
@@ -43,6 +49,8 @@ describe('TicketsService', () => {
     events = { emit: jest.fn() };
     manager = {
       findOne: jest.fn(),
+      findOneByOrFail: jest.fn(),
+      insert: jest.fn(),
       update: jest.fn(),
       getRepository: jest.fn().mockReturnValue({
         create: (x: unknown) => x,
@@ -64,33 +72,77 @@ describe('TicketsService', () => {
       repo.findOne.mockResolvedValueOnce(mkTicket());
       const res = await service.ensureActiveTicket('u-1', 'موضوع');
       expect(res.created).toBe(false);
-      expect(repo.insert).not.toHaveBeenCalled();
+      expect(res.announcement).toBeNull();
+      expect(manager.insert).not.toHaveBeenCalled();
     });
 
     it('creates a ticket when none is active and emits ticket.created', async () => {
       repo.findOne.mockResolvedValueOnce(null);
-      repo.insert.mockResolvedValueOnce({ identifiers: [{ id: 't-1' }] });
-      repo.findOneByOrFail.mockResolvedValueOnce(mkTicket());
+      manager.insert.mockResolvedValueOnce({ identifiers: [{ id: 't-1' }] });
+      manager.findOneByOrFail.mockResolvedValueOnce(mkTicket());
 
       const res = await service.ensureActiveTicket('u-1', 'مشکل در پرداخت');
       expect(res.created).toBe(true);
-      expect(repo.insert).toHaveBeenCalledWith(
-        expect.objectContaining({ user_id: 'u-1', subject: 'مشکل در پرداخت' }),
+      expect(manager.insert).toHaveBeenCalledWith(
+        Ticket,
+        { user_id: 'u-1', subject: 'مشکل در پرداخت' },
       );
       expect(events.emit).toHaveBeenCalledWith(
         'ticket.created',
         expect.objectContaining({ ticket: expect.objectContaining({ id: 't-1' }) }),
       );
+      // no announce option → no SYSTEM message, no message.created event
+      expect(events.emit).not.toHaveBeenCalledWith('message.created', expect.anything());
+    });
+
+    it('ATOMIC ANNOUNCEMENT (review fix): ticket + opening SYSTEM message commit in ONE transaction', async () => {
+      repo.findOne.mockResolvedValueOnce(null);
+      manager.insert.mockResolvedValueOnce({ identifiers: [{ id: 't-1' }] });
+      manager.findOneByOrFail.mockResolvedValueOnce(mkTicket());
+
+      const res = await service.ensureActiveTicket('u-1', 'موضوع', {
+        announce: (ticketNumber) => `تیکت ${ticketNumber} ایجاد شد.`,
+      });
+
+      expect(res.created).toBe(true);
+      // the announcement is part of the RESULT — the orchestrator no longer
+      // writes it separately (a crash between the two is impossible now)
+      expect(res.announcement).toMatchObject({ id: 'm-1', role: MessageRole.SYSTEM });
+      expect(res.announcement?.content).toBe('تیکت TKT-10001 ایجاد شد.');
+      // the announcement bumps the list's sort key INSIDE the same transaction
+      expect(manager.update).toHaveBeenCalledWith(Ticket, 't-1', { last_message_at: expect.any(Date) });
+      // events fire only AFTER the commit (message-creation contract)
+      expect(events.emit).toHaveBeenCalledWith('ticket.created', expect.anything());
+      expect(events.emit).toHaveBeenCalledWith(
+        'message.created',
+        expect.objectContaining({ message: expect.objectContaining({ role: MessageRole.SYSTEM }) }),
+      );
+    });
+
+    it('announce + failed commit → ticket AND announcement roll back together, no events', async () => {
+      repo.findOne.mockResolvedValueOnce(null);
+      manager.insert.mockResolvedValueOnce({ identifiers: [{ id: 't-1' }] });
+      manager.findOneByOrFail.mockResolvedValueOnce(mkTicket());
+      dataSource.transaction.mockImplementationOnce(async (cb: (m: unknown) => Promise<unknown>) => {
+        await cb(manager);
+        throw new Error('commit failed');
+      });
+
+      await expect(
+        service.ensureActiveTicket('u-1', null, { announce: () => 'x' }),
+      ).rejects.toThrow('commit failed');
+      expect(events.emit).not.toHaveBeenCalled();
     });
 
     it('recovers from the concurrent-insert race (23505) by re-reading the winner', async () => {
       repo.findOne
         .mockResolvedValueOnce(null) // no active ticket → try insert
         .mockResolvedValueOnce(mkTicket({ id: 't-winner' })); // refetch after violation
-      repo.insert.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: '23505' }));
+      manager.insert.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: '23505' }));
 
       const res = await service.ensureActiveTicket('u-1', null);
       expect(res.created).toBe(false);
+      expect(res.announcement).toBeNull();
       expect(res.ticket.id).toBe('t-winner');
     });
   });

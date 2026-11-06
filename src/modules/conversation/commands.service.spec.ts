@@ -1,10 +1,9 @@
 import { CommandsService, parseCommand } from './commands.service';
 import { TicketsService } from '../tickets/tickets.service';
-import { MessagesService } from '../messages/messages.service';
 import { TelegramGateway } from '../telegram/telegram-gateway.interface';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { Ticket } from '../../database/entities/ticket.entity';
-import { TicketStatus } from '../../database/enums';
+import { MessageRole, TicketStatus } from '../../database/enums';
 
 const mkUser = (): TelegramUser => ({ id: 'u-1', chat_id: '555' }) as TelegramUser;
 const mkTicket = (over: Partial<Ticket> = {}): Ticket =>
@@ -25,7 +24,6 @@ describe('parseCommand', () => {
 describe('CommandsService', () => {
   let service: CommandsService;
   let tickets: { ensureActiveTicket: jest.Mock; findActiveTicket: jest.Mock; findLastTicket: jest.Mock; changeStatus: jest.Mock };
-  let messages: { addOutboundMessage: jest.Mock };
   let gateway: { active: boolean; sendMessage: jest.Mock };
 
   beforeEach(() => {
@@ -35,35 +33,44 @@ describe('CommandsService', () => {
       findLastTicket: jest.fn(),
       changeStatus: jest.fn().mockResolvedValue({ changed: true }),
     };
-    messages = { addOutboundMessage: jest.fn().mockResolvedValue(undefined) };
     gateway = { active: true, sendMessage: jest.fn().mockResolvedValue({ message_id: '1' }) };
     service = new CommandsService(
       tickets as unknown as TicketsService,
-      messages as unknown as MessagesService,
       gateway as unknown as TelegramGateway,
     );
   });
 
-  it('/new creates a ticket and announces it durably (SYSTEM, no ephemeral send)', async () => {
-    tickets.ensureActiveTicket.mockResolvedValueOnce({ ticket: mkTicket(), created: true });
+  it('/new creates a ticket whose ATOMIC announcement was stored in the creation transaction (review fix)', async () => {
+    tickets.ensureActiveTicket.mockResolvedValueOnce({
+      ticket: mkTicket(),
+      created: true,
+      announcement: { id: 'm-a', role: MessageRole.SYSTEM, content: 'تیکت TKT-10001 ایجاد شد.\nلطفاً شرح مشکل خود را بنویسید.' },
+    });
 
     await service.handle(mkUser(), '555', { name: 'new', raw: '/new' });
 
-    expect(messages.addOutboundMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ role: 'SYSTEM', ticket_id: 't-1', content: expect.stringContaining('TKT-10001') }),
+    // the announcement is passed to ensureActiveTicket and lives in ITS
+    // transaction — a crash between ticket creation and announcement is
+    // impossible, so the orchestrator writes nothing itself
+    expect(tickets.ensureActiveTicket).toHaveBeenCalledWith(
+      'u-1',
+      null,
+      expect.objectContaining({ announce: expect.any(Function) }),
     );
-    expect(gateway.sendMessage).not.toHaveBeenCalled();
+    const announce = tickets.ensureActiveTicket.mock.calls[0][2].announce as (n: string) => string;
+    expect(announce('TKT-42')).toContain('TKT-42');
+    expect(announce('TKT-42')).toContain('لطفاً شرح مشکل خود را بنویسید');
+    expect(gateway.sendMessage).not.toHaveBeenCalled(); // durable path — nothing ephemeral
   });
 
   it('/new with an active ticket answers ephemerally', async () => {
-    tickets.ensureActiveTicket.mockResolvedValueOnce({ ticket: mkTicket(), created: false });
+    tickets.ensureActiveTicket.mockResolvedValueOnce({ ticket: mkTicket(), created: false, announcement: null });
 
     await service.handle(mkUser(), '555', { name: 'new', raw: '/new' });
 
     expect(gateway.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ chat_id: '555', text: expect.stringContaining('فعال') }),
     );
-    expect(messages.addOutboundMessage).not.toHaveBeenCalled();
   });
 
   it('/status shows the active ticket with its Persian status label', async () => {

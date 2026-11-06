@@ -51,6 +51,36 @@ const FORBIDDEN_ADMIN_PASSWORDS = new Set([
   'qwerty123',
 ]);
 
+/** Blank after trimming — length rules must never pass a whitespace-padded
+ *  value (review fix: "32 spaces" must not clear a 32-char check). */
+function isBlank(value: string): boolean {
+  return value.trim().length === 0;
+}
+
+/** Obviously-low-entropy bodies (review fix): a single repeated character, or
+ *  a short block (≤ 8 chars) repeated to pad the length. Real random secrets
+ *  never have this shape. */
+function isRepetitivePattern(value: string): boolean {
+  const trimmed = value.trim();
+  return /^(.)\1+$/.test(trimmed) || /^(.{1,8})\1+$/.test(trimmed);
+}
+
+/** Independent admin-password strength check (review fix): ≥ 12 trimmed
+ *  characters, not a known default, not a repetitive pattern, and at least
+ *  3 of the 4 character classes (lowercase / UPPERCASE / digits / symbols —
+ *  whitespace never counts as a class). */
+function isStrongAdminPassword(password: string): boolean {
+  if (FORBIDDEN_ADMIN_PASSWORDS.has(password)) return false;
+  if (isRepetitivePattern(password)) return false;
+  if (password.length < 12) return false;
+  const classes =
+    (/[a-z]/.test(password) ? 1 : 0) +
+    (/[A-Z]/.test(password) ? 1 : 0) +
+    (/\d/.test(password) ? 1 : 0) +
+    (/[^\sa-zA-Z0-9]/.test(password) ? 1 : 0);
+  return classes >= 3;
+}
+
 export const RawEnvSchema = z
   .object({
     // --- runtime environment (drives the production rules below) ---
@@ -76,7 +106,7 @@ export const RawEnvSchema = z
     // --- auth / first admin ---
     JWT_SECRET: z
       .string()
-      .min(16, 'required and must be at least 16 characters (no default on purpose)'),
+      .min(1, 'required and must be a real secret (no default on purpose) — length is validated after trimming'),
     JWT_EXPIRES_IN: z.string().default('8h'),
     ADMIN_EMAIL: z.string().email().default('admin@abrit.local'),
     ADMIN_PASSWORD: z.string()
@@ -103,37 +133,61 @@ export const RawEnvSchema = z
   .superRefine((cfg, ctx) => {
     const isProduction = cfg.NODE_ENV === 'production';
 
-    // --- JWT secret: known/example values never pass, anywhere ---
-    // (underscores and hyphens are treated alike so both placeholder styles die)
-    const normalizedSecret = cfg.JWT_SECRET.trim().toLowerCase().replace(/_/g, '-');
-    if (FORBIDDEN_JWT_SECRETS.has(normalizedSecret)) {
+    // --- JWT secret: length is enforced on the TRIMMED value, blank and
+    // obviously-weak bodies are rejected EVERYWHERE (review fix: raw-length
+    // checks let "32 spaces" or "a" × 32 pass) ---
+    if (isBlank(cfg.JWT_SECRET)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['JWT_SECRET'],
-        message: 'this is a known/example value — generate a real secret, e.g. `openssl rand -hex 32`',
+        message: 'must not be blank/whitespace — generate a real secret, e.g. `openssl rand -hex 32`',
       });
-    } else if (isProduction && cfg.JWT_SECRET.length < 32) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['JWT_SECRET'],
-        message: 'must be at least 32 characters in production (e.g. `openssl rand -hex 32`)',
-      });
+    } else {
+      // (underscores and hyphens are treated alike so both placeholder styles die)
+      const normalizedSecret = cfg.JWT_SECRET.trim().toLowerCase().replace(/_/g, '-');
+      const trimmedSecret = cfg.JWT_SECRET.trim();
+      if (FORBIDDEN_JWT_SECRETS.has(normalizedSecret)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['JWT_SECRET'],
+          message: 'this is a known/example value — generate a real secret, e.g. `openssl rand -hex 32`',
+        });
+      } else if (isRepetitivePattern(cfg.JWT_SECRET)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['JWT_SECRET'],
+          message: 'this is a repeated pattern — far too predictable. Use a real random secret, e.g. `openssl rand -hex 32`',
+        });
+      } else if (isProduction && trimmedSecret.length < 32) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['JWT_SECRET'],
+          message: 'must be at least 32 characters in production (e.g. `openssl rand -hex 32`)',
+        });
+      } else if (!isProduction && trimmedSecret.length < 16) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['JWT_SECRET'],
+          message: 'must be at least 16 characters (whitespace does not count)',
+        });
+      }
     }
 
-    // --- first admin: production requires an explicit, non-default password ---
+    // --- first admin: production requires an explicit, strong password ---
     if (isProduction) {
       const password = cfg.ADMIN_PASSWORD;
-      if (!password) {
+      if (!password || isBlank(password)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['ADMIN_PASSWORD'],
-          message: 'must be set explicitly in production (the development default is not allowed)',
+          message: 'must be set explicitly in production (blank/whitespace is not a password)',
         });
-      } else if (FORBIDDEN_ADMIN_PASSWORDS.has(password) || password.length < 12) {
+      } else if (!isStrongAdminPassword(password.trim())) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['ADMIN_PASSWORD'],
-          message: 'must be a strong unique value in production (12+ chars, not a known default)',
+          message:
+            'must be a strong unique value in production — 12+ trimmed characters with at least 3 of lowercase/UPPERCASE/digits/symbols',
         });
       }
 
