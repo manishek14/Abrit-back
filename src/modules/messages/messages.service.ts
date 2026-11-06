@@ -22,6 +22,33 @@ export const MAX_DELIVERY_ATTEMPTS = 5;
 /** Delivery lease: a claimed message cannot be re-claimed for this long (review fix #2). */
 export const DELIVERY_LEASE_MS = 60_000;
 
+/**
+ * Retry backoff (review round 5 fix): after the Nth transient failure the next
+ * attempt waits `base * 2^(N-1)` (± 20% jitter), capped at MAX. With the 5
+ * attempts this yields a schedule of ~20 s → ~40 s → ~80 s → ~160 s, so the
+ * last retry lands ~5 minutes after the first — a 2-minute Telegram outage no
+ * longer burns the whole retry budget within the first minute of 15 s sweeps.
+ */
+export const OUTBOX_RETRY_BASE_MS = 20_000;
+export const OUTBOX_RETRY_MAX_MS = 10 * 60_000;
+
+/**
+ * Exponential backoff + jitter for the NEXT delivery attempt.
+ * @param failedAttempt 1-based number of the attempt that JUST failed
+ *   (delivery_attempts as counted at claim time).
+ * @param rand injectable for tests — the jitter source in [0, 1).
+ */
+export function computeRetryBackoffMs(
+  failedAttempt: number,
+  rand: number = Math.random(),
+): number {
+  const exponential =
+    OUTBOX_RETRY_BASE_MS * 2 ** Math.min(Math.max(failedAttempt - 1, 0), 10);
+  const capped = Math.min(exponential, OUTBOX_RETRY_MAX_MS);
+  const jitter = 1 + (rand * 2 - 1) * 0.2; // ± 20%
+  return Math.max(1_000, Math.round(capped * jitter));
+}
+
 /** Initial conversation page size (review fix: agents land on the NEWEST slice). */
 export const INITIAL_PAGE_SIZE = 50;
 
@@ -344,8 +371,10 @@ export class MessagesService {
   }
 
   /** Outbox scan for the sweeper: PENDING + retryable FAILED, capped attempts,
-   *  retry_after deferrals respected, optionally skipping fresh rows that the
-   *  immediate dispatcher may still be sending. */
+   *  retry_after deferrals AND the backoff schedule (next_attempt_at) respected,
+   *  optionally skipping fresh rows that the immediate dispatcher may still be
+   *  sending (review round 5: a transient failure no longer retries on the
+   *  very next 15 s sweep — it waits for its scheduled slot). */
   async findDueOutbox(
     limit = 20,
     opts: { freshWindowMs?: number } = {},
@@ -359,6 +388,7 @@ export class MessagesService {
       .andWhere(
         `NOT (m.meta ->> 'retry_after_until' IS NOT NULL AND (m.meta ->> 'retry_after_until')::timestamptz > now())`,
       )
+      .andWhere('(m.next_attempt_at IS NULL OR m.next_attempt_at <= now())')
       .orderBy('m.id', 'ASC')
       .take(limit);
 
@@ -400,6 +430,7 @@ export class MessagesService {
           AND delivery_status IN ('PENDING', 'FAILED')
           AND delivery_attempts < $2
           AND (claimed_at IS NULL OR claimed_at < now() - make_interval(secs => $3))
+          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
           AND NOT (
             meta ->> 'retry_after_until' IS NOT NULL
             AND (meta ->> 'retry_after_until')::timestamptz > now()
@@ -411,9 +442,29 @@ export class MessagesService {
   }
 
   /**
+   * LEASE RENEWAL / heartbeat (review round 5 fix #2): a sender whose current
+   * chunk's network call could outlive its lease renews claimed_at BEFORE the
+   * call, so a slow-but-alive delivery can no longer be double-claimed by the
+   * sweeper mid-flight. Combined with the Telegram send timeout (< lease) a
+   * single renewed lease always covers one request. Fenced by the claim token
+   * — false means another worker owns the row and the caller must abort.
+   */
+  async renewDeliveryClaim(messageId: string, claimToken: string): Promise<boolean> {
+    const rows = await this.repo.query(
+      `UPDATE messages
+          SET claimed_at = now()
+        WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $2::text
+        RETURNING id`,
+      [messageId, claimToken],
+    );
+    return rows.length > 0;
+  }
+
+  /**
    * Terminal SENT write — FENCED by the claim token (review fix): only the
    * CURRENT owner can finish a message. A zombie whose lease expired matches
    * 0 rows; null is returned and the caller must treat the send as lost.
+   * The backoff schedule is cleared — a SENT message is never due again.
    */
   async markSent(
     messageId: string,
@@ -426,7 +477,8 @@ export class MessagesService {
               telegram_message_id = $2::bigint,
               sent_at = now(),
               error = NULL,
-              claimed_at = NULL
+              claimed_at = NULL,
+              next_attempt_at = NULL
         WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
         RETURNING *`,
       [messageId, telegramMessageId, claimToken],
@@ -437,20 +489,29 @@ export class MessagesService {
   }
 
   /**
-   * Failed send → FAILED (retryable while attempts < MAX; the sweeper picks it
-   * up with backoff). The attempt counter was already consumed at claim time —
-   * this write only records the outcome — and the write is fenced by the
-   * claim token (review fix).
+   * Transient failure → FAILED with the NEXT attempt SCHEDULED (review round 5
+   * fix — real backoff): `nextAttemptAt` comes from computeRetryBackoffMs, so
+   * the sweeper skips the row until its slot instead of hammering Telegram
+   * every 15 s. The attempt counter was already consumed at claim time — this
+   * write only records the outcome — and the write is fenced by the claim
+   * token. Passing NO nextAttemptAt keeps the existing schedule (used only by
+   * older callers; the dispatcher always passes one).
    */
-  async markFailed(messageId: string, error: string, claimToken: string): Promise<Message | null> {
+  async markFailed(
+    messageId: string,
+    error: string,
+    claimToken: string,
+    nextAttemptAt?: Date,
+  ): Promise<Message | null> {
     const rows = await this.repo.query(
       `UPDATE messages
           SET delivery_status = 'FAILED',
               error = LEFT($2::text, 500),
-              claimed_at = NULL
+              claimed_at = NULL,
+              next_attempt_at = COALESCE($4::timestamptz, next_attempt_at)
         WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
         RETURNING *`,
-      [messageId, error, claimToken],
+      [messageId, error, claimToken, nextAttemptAt?.toISOString() ?? null],
     );
     const updated = firstRawRow<Message>(rows);
     if (updated) this.events.emit('message.updated', { message: updated });
@@ -458,7 +519,8 @@ export class MessagesService {
   }
 
   /** Terminal failure (403 blocked / chat not found / telegram disabled) — sweeper
-   *  stops retrying. Fenced by the claim token (review fix). */
+   *  stops retrying and the backoff schedule is cleared. Fenced by the claim
+   *  token (review fix). */
   async markPermanentlyFailed(
     messageId: string,
     error: string,
@@ -469,7 +531,8 @@ export class MessagesService {
           SET delivery_status = 'FAILED',
               error = LEFT($2::text, 500),
               delivery_attempts = $4,
-              claimed_at = NULL
+              claimed_at = NULL,
+              next_attempt_at = NULL
         WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
         RETURNING *`,
       [messageId, error, claimToken, MAX_DELIVERY_ATTEMPTS],
@@ -479,8 +542,10 @@ export class MessagesService {
     return updated;
   }
 
-  /** Telegram 429 — park the message until retry_after elapses (meta.retry_after_until).
-   *  Fenced by the claim token; the attempt was consumed at claim time. */
+  /** Telegram 429 — park the message until retry_after elapses (meta.retry_after_until);
+   *  the explicit Telegram signal replaces the computed backoff, so
+   *  next_attempt_at is cleared here. Fenced by the claim token; the attempt
+   *  was consumed at claim time. */
   async deferRetry(
     messageId: string,
     retryAfterSeconds: number,
@@ -492,6 +557,7 @@ export class MessagesService {
           SET delivery_status = 'FAILED',
               error = LEFT($2::text, 500),
               claimed_at = NULL,
+              next_attempt_at = NULL,
               meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('retry_after_until', $4::timestamptz)
         WHERE id = $1 AND COALESCE(meta ->> 'claim_token', '') = $3::text
         RETURNING *`,
@@ -499,6 +565,39 @@ export class MessagesService {
     );
     const updated = firstRawRow<Message>(rows);
     if (updated) this.events.emit('message.updated', { message: updated });
+    return updated;
+  }
+
+  /**
+   * MANUAL RETRY from the panel (review round 5 fix): re-arms a FAILED message
+   * — attempts reset, backoff schedule and error cleared, claim fencing and a
+   * stale 429 deferral removed — while the multi-chunk progress (sent_chunks /
+   * first_telegram_message_id) is KEPT so the retry resumes at the first UNSENT
+   * chunk instead of duplicating delivered parts. Emits message.retry_requested
+   * (the dispatcher drives the immediate delivery) and message.updated (the
+   * panel's badge flips to "Sending…"). Returns null when the row is missing
+   * or not FAILED — callers answer 404 / 409.
+   */
+  async retryFailedMessage(messageId: string, ticketId?: string): Promise<Message | null> {
+    const rows = await this.repo.query(
+      `UPDATE messages
+          SET delivery_status = 'PENDING',
+              delivery_attempts = 0,
+              error = NULL,
+              claimed_at = NULL,
+              next_attempt_at = NULL,
+              meta = COALESCE(meta, '{}'::jsonb) - 'claim_token' - 'retry_after_until'
+        WHERE id = $1
+          AND delivery_status = 'FAILED'
+          AND ($2::uuid IS NULL OR ticket_id = $2::uuid)
+        RETURNING *`,
+      [messageId, ticketId ?? null],
+    );
+    const updated = firstRawRow<Message>(rows);
+    if (updated) {
+      this.events.emit('message.retry_requested', { message: updated });
+      this.events.emit('message.updated', { message: updated });
+    }
     return updated;
   }
 

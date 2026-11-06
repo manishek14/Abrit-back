@@ -52,6 +52,17 @@ export class Message {
   @Column({ type: 'int', default: 0 })
   delivery_attempts: number;
 
+  /**
+   * Scheduled next delivery attempt (review round 5 fix — real backoff):
+   * every TRANSIENT failure writes `now + exponential-backoff-with-jitter`
+   * here, so a Telegram outage no longer burns all 5 attempts in ~1 minute of
+   * 15-second sweeps. Both the sweeper scan and the atomic claim skip rows
+   * whose next_attempt_at is still in the future (429 retry_after_until keeps
+   * working alongside it — the explicit Telegram signal wins).
+   */
+  @Column({ type: 'timestamptz', nullable: true })
+  next_attempt_at: Date | null;
+
   @Column({ type: 'text', nullable: true })
   error: string | null;
 

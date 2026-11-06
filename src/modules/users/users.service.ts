@@ -82,6 +82,31 @@ export class UsersService {
     await this.repo.update({ id }, { is_blocked });
   }
 
+  /**
+   * RACE-SAFE blocking (review round 5 fix #4): flags the user as blocked ONLY
+   * if NO incoming message newer than `activityCutoff` exists. Every fresh
+   * update bumps telegram_users.last_seen_at (upsertTelegramUser), so the
+   * single conditional UPDATE makes the check-and-set atomic:
+   *   - last_seen_at < cutoff → no newer activity → the 403 is the newest
+   *     reality → block;
+   *   - last_seen_at ≥ cutoff → the user already unblocked and sent a NEW
+   *     message while this old send was in flight → the late 403 must NOT
+   *     overwrite the newer state (0 rows updated → false).
+   * Returns true when the row was flagged.
+   */
+  async setBlockedIfNoNewerActivity(id: string, activityCutoff: Date): Promise<boolean> {
+    const rows = await this.repo.query(
+      `UPDATE telegram_users
+          SET is_blocked = true,
+              updated_at = now()
+        WHERE id = $1
+          AND last_seen_at < $2::timestamptz
+        RETURNING id`,
+      [id, activityCutoff.toISOString()],
+    );
+    return rows.length > 0;
+  }
+
   /** Admin panel list — search across username/name/telegram id + per-user ticket counts (no N+1). */
   async listUsers(params: {
     q?: string;

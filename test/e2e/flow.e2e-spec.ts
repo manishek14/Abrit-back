@@ -4,6 +4,8 @@ import { INestApplication } from '@nestjs/common';
 import { io as socketIoClient } from 'socket.io-client';
 import { SweeperService } from '../../src/modules/telegram/sweeper.service';
 import { OutboxDispatcherService } from '../../src/modules/telegram/outbox-dispatcher.service';
+import { MessagesService } from '../../src/modules/messages/messages.service';
+import { TelegramApiError } from '../../src/modules/telegram/telegram-gateway.interface';
 import { InboxRetentionService } from '../../src/modules/inbox/inbox-retention.service';
 import { AI_INACTIVE_MESSAGE } from '../../src/common/ticket-labels';
 import { FakeTelegramGateway } from '../fakes/telegram-gateway.fake';
@@ -920,6 +922,147 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect((await post({ update_id: 'x', message: {} })).status).toBe(400); // non-numeric id
     expect((await post([1, 2, 3])).status).toBe(400); // not an object
     expect(await count('bot_updates')).toBe(0);
+  });
+
+  it('WEBHOOK (review round 5 #3): a message WITHOUT chat is a clean 400 — never an inbox row that fails processing', async () => {
+    const server = app.getHttpServer();
+    const post = (body: unknown) =>
+      request(server).post('/api/telegram/webhook').set('x-telegram-bot-api-secret-token', webhookSecret).send(body as object);
+
+    // valid-looking message but NO chat → the orchestrator would crash on
+    // message.chat.id — it must be rejected here instead
+    expect(
+      (await post({ update_id: nextUpdateId++, message: { message_id: 1, text: 'سلام' } })).status,
+    ).toBe(400);
+    // chat present but without a type — also rejected
+    expect(
+      (await post({
+        update_id: nextUpdateId++,
+        message: { message_id: 2, chat: { id: 111 }, text: 'سلام' },
+      })).status,
+    ).toBe(400);
+    // a proper update STILL passes
+    expect((await post(messageUpdate(950750, 'پیام سالم'))).status).toBe(200);
+
+    expect(await count('bot_updates')).toBe(1); // only the healthy one
+  });
+
+  it('RETRY BACKOFF (review round 5 #1): a transient failure schedules a real backoff, the sweeper honors it, and the panel can retry manually', async () => {
+    const [user] = await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id) VALUES ('950800', '950800') RETURNING *`,
+    );
+    const [ticket] = await ds.query(
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'بک‌آف') RETURNING *`,
+      [user.id],
+    );
+    const [msg] = await ds.query(
+      `INSERT INTO messages (ticket_id, role, content, delivery_status) VALUES ($1, 'ASSISTANT', 'پیام قطع شبکه', 'PENDING') RETURNING *`,
+      [ticket.id],
+    );
+
+    // simulate a Telegram outage: the send fails transiently
+    fakeGateway.failNext = true;
+    await app.get(OutboxDispatcherService).deliver(msg);
+
+    const [failed] = await ds.query(
+      `SELECT delivery_status, delivery_attempts, next_attempt_at, error FROM messages WHERE id = $1`,
+      [msg.id],
+    );
+    expect(failed.delivery_status).toBe('FAILED');
+    expect(Number(failed.delivery_attempts)).toBe(1); // consumed at claim time
+    expect(failed.error).toContain('simulated telegram failure');
+    // THE FIX: the next attempt is SCHEDULED ~20 s out — the old code left it
+    // NULL and the 15 s sweeper burned all 5 attempts within a minute
+    expect(new Date(failed.next_attempt_at).getTime()).toBeGreaterThan(Date.now() + 10_000);
+    expect(fakeGateway.sent).toHaveLength(0);
+
+    // the sweeper scan SKIPS the scheduled row...
+    const due = await app.get(MessagesService).findDueOutbox(50);
+    expect(due.find((m: { id: string }) => m.id === msg.id)).toBeUndefined();
+    // ...and a fresh claim cannot steal it either
+    expect(await app.get(MessagesService).claimForDelivery(msg.id)).toBeNull();
+
+    // the operator retries from the panel → re-armed and delivered NOW
+    const res = await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages/${msg.id}/retry`)
+        .send({}),
+    ).expect(200);
+    expect(res.body.data.delivery_status).toBe('PENDING');
+    expect(Number(res.body.data.delivery_attempts)).toBe(0);
+
+    await waitFor(async () => {
+      const [r] = await ds.query(`SELECT delivery_status FROM messages WHERE id = $1`, [msg.id]);
+      return r.delivery_status === 'SENT';
+    });
+    expect(fakeGateway.sent.filter((s) => s.text === 'پیام قطع شبکه')).toHaveLength(1);
+
+    // retrying a SENT message is a 409; a foreign message id is a 404
+    await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages/${msg.id}/retry`)
+        .send({}),
+    ).expect(409);
+    await authed(
+      request(app.getHttpServer())
+        .post(`/api/tickets/${ticket.id}/messages/999999/retry`)
+        .send({}),
+    ).expect(404);
+  });
+
+  it('BLOCKED RACE (review round 5 #4): a late 403 can NOT re-block a user whose newer message already arrived', async () => {
+    const [user] = await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id) VALUES ('950810', '950810') RETURNING *`,
+    );
+    const [ticket] = await ds.query(
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'مسابقه وضعیت') RETURNING *`,
+      [user.id],
+    );
+    const [msg] = await ds.query(
+      `INSERT INTO messages (ticket_id, role, content, delivery_status) VALUES ($1, 'ASSISTANT', 'ارسال قدیمی', 'PENDING') RETURNING *`,
+      [ticket.id],
+    );
+
+    // the RACE: after this old send was claimed, the user unblocked the bot and
+    // sent a fresh message — its processing bumped last_seen_at PAST the claim
+    await ds.query(`UPDATE telegram_users SET last_seen_at = now() + interval '2 seconds' WHERE id = $1`, [user.id]);
+    fakeGateway.failNextWith(new TelegramApiError('Forbidden: bot was blocked by the user', 403, true));
+
+    await app.get(OutboxDispatcherService).deliver(msg);
+
+    // the stale 403 must NOT overwrite the newer unblocked state...
+    const [after] = await ds.query(`SELECT is_blocked FROM telegram_users WHERE id = $1`, [user.id]);
+    expect(after.is_blocked).toBe(false);
+    // ...but the message itself is still terminal (403s never retry)
+    const [m] = await ds.query(
+      `SELECT delivery_status, delivery_attempts FROM messages WHERE id = $1`,
+      [msg.id],
+    );
+    expect(m.delivery_status).toBe('FAILED');
+    expect(Number(m.delivery_attempts)).toBe(5);
+  });
+
+  it('BLOCKED (no newer activity): a 403 without any newer incoming message still flags the user', async () => {
+    const [user] = await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id) VALUES ('950820', '950820') RETURNING *`,
+    );
+    const [ticket] = await ds.query(
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'کاربر رفته') RETURNING *`,
+      [user.id],
+    );
+    const [msg] = await ds.query(
+      `INSERT INTO messages (ticket_id, role, content, delivery_status) VALUES ($1, 'ASSISTANT', 'ارسال به رفته‌ها', 'PENDING') RETURNING *`,
+      [ticket.id],
+    );
+
+    // NO new activity since the message was processed — the 403 is the newest reality
+    await ds.query(`UPDATE telegram_users SET last_seen_at = now() - interval '5 seconds' WHERE id = $1`, [user.id]);
+    fakeGateway.failNextWith(new TelegramApiError('Forbidden: bot was blocked by the user', 403, true));
+
+    await app.get(OutboxDispatcherService).deliver(msg);
+
+    const [after] = await ds.query(`SELECT is_blocked FROM telegram_users WHERE id = $1`, [user.id]);
+    expect(after.is_blocked).toBe(true); // the guard lets the honest flag through
   });
 
   it('RETENTION: old inbox rows are purged; conversation history is untouched', async () => {

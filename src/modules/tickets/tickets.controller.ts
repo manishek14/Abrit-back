@@ -1,8 +1,10 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
+  HttpCode,
   HttpStatus,
   NotFoundException,
   Param,
@@ -13,14 +15,29 @@ import {
   Res,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { IsInt, IsNotEmpty, IsOptional, IsString, Matches, Max, MaxLength, Min, Validate } from 'class-validator';
+import { IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, Validate } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { TicketsService } from './tickets.service';
-import { MessagesService, MAX_PAGE_SIZE } from '../messages/messages.service';
+import {
+  MessagesService,
+  MAX_PAGE_SIZE,
+} from '../messages/messages.service';
 import { ListTicketsQueryDto } from './dto/list-tickets-query.dto';
 import { UpdateTicketStatusDto } from './dto/update-ticket-status.dto';
 import { CurrentAdmin, CurrentAdminPayload } from '../../common/decorators/current-admin.decorator';
 import { IsMessageIdCursorConstraint } from '../../common/validators/message-id-cursor.validator';
+
+/** Path params for the manual retry endpoint. BOTH route params live on the
+ *  same DTO — the global ValidationPipe runs with forbidNonWhitelisted, so an
+ *  undeclared `id` field would 400 the request. */
+export class RetryMessageParamsDto {
+  @IsUUID()
+  id!: string;
+
+  @IsString()
+  @Validate(IsMessageIdCursorConstraint)
+  messageId!: string;
+}
 
 /**
  * Minimal structural type for Nest's passthrough @Res() object — avoids a
@@ -171,5 +188,33 @@ export class TicketsController {
     });
     if (replayed) res.status(HttpStatus.OK); // idempotent replay — not a new create
     return { data: message };
+  }
+
+  /**
+   * MANUAL RETRY of a FAILED delivery (review round 5 fix #1): re-arms the
+   * outbox row (attempts reset, backoff/error/429-deferral cleared, multi-chunk
+   * progress KEPT) and drives an immediate delivery via message.retry_requested.
+   * Scoped to THIS ticket — a message id from another ticket is a 404. A row
+   * that is not FAILED is a 409 (PENDING is already being delivered, SENT is
+   * already delivered).
+   */
+  @Post(':id/messages/:messageId/retry')
+  @HttpCode(HttpStatus.OK) // an ACTION on an existing row, not a new resource
+  async retryMessage(@Param() params: RetryMessageParamsDto) {
+    const id = params.id;
+    const ticket = await this.ticketsService.findById(id);
+    if (!ticket) throw new NotFoundException('Ticket not found');
+
+    const retried = await this.messagesService.retryFailedMessage(params.messageId, id);
+    if (!retried) {
+      // either the message does not exist in this ticket (404) or it is not
+      // FAILED (409) — distinguish so the panel can show the right message
+      const message = await this.messagesService.findById(params.messageId);
+      if (!message || message.ticket_id !== id) {
+        throw new NotFoundException('Message not found in this ticket');
+      }
+      throw new ConflictException('Only FAILED messages can be retried');
+    }
+    return { data: retried };
   }
 }

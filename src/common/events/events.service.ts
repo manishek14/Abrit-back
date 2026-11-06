@@ -19,6 +19,9 @@ export interface DomainEvents {
   };
   'message.created': { message: Message };
   'message.updated': { message: Message };
+  /** Manual panel retry (review round 5): a FAILED message was re-armed by an
+   *  operator — the outbox dispatcher drives an immediate delivery attempt. */
+  'message.retry_requested': { message: Message };
   /** Fires only for FIRST-SEEN users so the panel's user list stays live
    *  (review fix) without refetching on every profile refresh. */
   'user.created': { user: TelegramUser };

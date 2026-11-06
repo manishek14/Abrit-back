@@ -33,10 +33,16 @@ export function isValidUpdateShape(update: unknown): update is RawTelegramUpdate
     if (typeof message.message_id !== 'number' || !Number.isInteger(message.message_id)) {
       return false;
     }
+    // chat is REQUIRED whenever a message exists (review round 5 fix #3): the
+    // orchestrator reads message.chat.id unconditionally (chat key, user
+    // upsert, per-chat ordering), so a "message" without a valid chat used to
+    // pass validation, enter the inbox, fail processing and burn sweeper
+    // retries — it must be a clean 400 instead, BEFORE the row is stored.
     const chat = message.chat;
-    if (chat !== undefined && (!isPlainObject(chat) || !['number', 'string'].includes(typeof chat.id))) {
+    if (!isPlainObject(chat) || !['number', 'string'].includes(typeof chat.id)) {
       return false;
     }
+    if (typeof chat.type !== 'string') return false;
     const from = message.from;
     if (from !== undefined && !isPlainObject(from)) return false;
     if (message.text !== undefined && typeof message.text !== 'string') return false;

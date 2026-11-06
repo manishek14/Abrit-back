@@ -72,4 +72,27 @@ describe('UsersService', () => {
     expect(repo.findOneBy).toHaveBeenCalledWith({ telegram_id: '111' });
     expect(found?.id).toBe('u-1');
   });
+
+  describe('setBlockedIfNoNewerActivity (review round 5 fix #4 — blocked-status race)', () => {
+    it('atomically guards the flag on last_seen_at < cutoff and reports the outcome', async () => {
+      repo.query.mockResolvedValueOnce([{ id: 'u-1' }]);
+      const cutoff = new Date('2026-01-01T10:00:00Z');
+
+      const flagged = await service.setBlockedIfNoNewerActivity('u-1', cutoff);
+
+      expect(flagged).toBe(true);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('SET is_blocked = true');
+      // THE GUARD: the write only lands when NO newer incoming message exists —
+      // a late 403 from an old in-flight send can never overwrite the newer
+      // unblocked state of a user who already messaged the bot again.
+      expect(sql).toContain('last_seen_at < $2::timestamptz');
+      expect(params).toEqual(['u-1', cutoff.toISOString()]);
+    });
+
+    it('reports FALSE when a newer message exists (0 rows updated) — the user stays unblocked', async () => {
+      repo.query.mockResolvedValueOnce([]);
+      expect(await service.setBlockedIfNoNewerActivity('u-1', new Date())).toBe(false);
+    });
+  });
 });

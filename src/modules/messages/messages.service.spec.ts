@@ -405,6 +405,9 @@ describe('MessagesService', () => {
       expect(sql).toContain("'claim_token'");
       expect(sql).toContain("delivery_status IN ('PENDING', 'FAILED')");
       expect(sql).toContain('claimed_at IS NULL OR claimed_at <');
+      // BACKOFF RESPECTED (review round 5): a message whose next attempt is
+      // still scheduled in the future can NEVER be claimed early.
+      expect(sql).toContain('next_attempt_at IS NULL OR next_attempt_at <= now()');
       expect(params[0]).toBe('m-1');
       expect(params[1]).toBe(5); // MAX_DELIVERY_ATTEMPTS
       expect(params[3]).toEqual(expect.stringMatching(/[0-9a-f-]{36}/)); // uuid token
@@ -413,6 +416,55 @@ describe('MessagesService', () => {
     it('returns null when another sender owns the claim (0 rows)', async () => {
       repo.query.mockResolvedValueOnce([]);
       expect(await service.claimForDelivery('m-1')).toBeNull();
+    });
+  });
+
+  describe('renewDeliveryClaim (review round 5 fix #2 — lease heartbeat)', () => {
+    it('refreshes claimed_at fenced by the claim token and reports ownership', async () => {
+      repo.query.mockResolvedValueOnce([{ id: 'm-1' }]);
+
+      const owned = await service.renewDeliveryClaim('m-1', 'tok-1');
+
+      expect(owned).toBe(true);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('SET claimed_at = now()');
+      expect(sql).toContain("COALESCE(meta ->> 'claim_token', '') = $2::text");
+      expect(params).toEqual(['m-1', 'tok-1']);
+    });
+
+    it('reports FALSE when the claim was lost (0 rows) — the sender must abort', async () => {
+      repo.query.mockResolvedValueOnce([]);
+      expect(await service.renewDeliveryClaim('m-1', 'tok-stale')).toBe(false);
+    });
+  });
+
+  describe('retryFailedMessage (review round 5 — manual panel retry)', () => {
+    it('re-arms a FAILED row: PENDING, attempts reset, backoff/429/claim cleared, progress KEPT', async () => {
+      const reArmed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.PENDING });
+      repo.query.mockResolvedValueOnce([reArmed]);
+
+      const result = await service.retryFailedMessage('m-1', 't-1');
+
+      expect(result).toBe(reArmed);
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain("delivery_status = 'PENDING'");
+      expect(sql).toContain('delivery_attempts = 0');
+      expect(sql).toContain('next_attempt_at = NULL');
+      expect(sql).toContain("- 'claim_token' - 'retry_after_until'"); // fenced keys removed…
+      expect(sql).not.toContain("- 'sent_chunks'"); // …multi-chunk progress PRESERVED
+      expect(sql).toContain("delivery_status = 'FAILED'"); // only FAILED rows are retryable
+      expect(sql).toContain('ticket_id = $2::uuid'); // scoped to the panel's ticket
+      expect(params).toEqual(['m-1', 't-1']);
+      // the dispatcher gets the immediate delivery; the panel gets the badge
+      expect(events.emit).toHaveBeenCalledWith('message.retry_requested', { message: reArmed });
+      expect(events.emit).toHaveBeenCalledWith('message.updated', { message: reArmed });
+    });
+
+    it('returns null when the row is missing or not FAILED (no event, no delivery)', async () => {
+      repo.query.mockResolvedValueOnce([]);
+
+      expect(await service.retryFailedMessage('m-404')).toBeNull();
+      expect(events.emit).not.toHaveBeenCalled();
     });
   });
 
@@ -511,24 +563,37 @@ describe('MessagesService', () => {
       expect(events.emit).not.toHaveBeenCalled();
     });
 
-    it('markFailed records the outcome but does NOT double-count the attempt (claim owns the counter)', async () => {
+    it('markFailed records the outcome and SCHEDULES the next attempt (review round 5 — real backoff)', async () => {
       const failed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.FAILED });
       repo.query.mockResolvedValueOnce([failed]);
+      const nextAt = new Date(Date.now() + 40_000);
 
-      const result = await service.markFailed('m-1', 'telegram is down', 'tok-1');
+      const result = await service.markFailed('m-1', 'telegram is down', 'tok-1', nextAt);
 
       expect(result).toBe(failed);
       const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain("delivery_status = 'FAILED'");
       expect(sql).toContain('LEFT($2::text, 500)');
+      expect(sql).toContain('next_attempt_at = COALESCE($4::timestamptz, next_attempt_at)');
       expect(sql).not.toContain('delivery_attempts ='); // consumed at claim time (review fix)
-      expect(params).toEqual(['m-1', 'telegram is down', 'tok-1']);
+      expect(params).toEqual(['m-1', 'telegram is down', 'tok-1', nextAt.toISOString()]);
       expect(events.emit).toHaveBeenCalledWith('message.updated', { message: failed });
+    });
+
+    it('markFailed without a next attempt keeps the existing schedule (COALESCE fallback)', async () => {
+      const failed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.FAILED });
+      repo.query.mockResolvedValueOnce([failed]);
+
+      await service.markFailed('m-1', 'telegram is down', 'tok-1');
+
+      const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('next_attempt_at = COALESCE($4::timestamptz, next_attempt_at)');
+      expect(params[3]).toBeNull();
     });
   });
 
   describe('findDueOutbox', () => {
-    it('scans only PENDING/FAILED rows below the attempt cap and respects retry_after', async () => {
+    it('scans only PENDING/FAILED rows below the attempt cap, respects retry_after AND the backoff schedule', async () => {
       const qb = {
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
@@ -546,12 +611,14 @@ describe('MessagesService', () => {
       );
       expect(qb.andWhere).toHaveBeenCalledWith('m.delivery_attempts < :max', { max: 5 });
       expect(qb.andWhere).toHaveBeenCalledWith(expect.stringContaining('retry_after_until'));
+      // REVIEW ROUND 5: a scheduled future attempt is skipped by the sweeper
+      expect(qb.andWhere).toHaveBeenCalledWith('(m.next_attempt_at IS NULL OR m.next_attempt_at <= now())');
       expect(qb.andWhere).toHaveBeenCalledWith('m.created_at < :cutoff', { cutoff: expect.any(Date) });
     });
   });
 
   describe('permanent failure & rate-limit deferral', () => {
-    it('markPermanentlyFailed caps attempts so the sweeper never retries again', async () => {
+    it('markPermanentlyFailed caps attempts, clears the backoff schedule, so the sweeper never retries again', async () => {
       const failed = mkMessage({ id: 'm-1', delivery_status: DeliveryStatus.FAILED });
       repo.query.mockResolvedValueOnce([failed]);
 
@@ -561,11 +628,12 @@ describe('MessagesService', () => {
       const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain('delivery_attempts = $4');
       expect(params[3]).toBe(5); // MAX_DELIVERY_ATTEMPTS
+      expect(sql).toContain('next_attempt_at = NULL');
       expect(sql).toContain('claim_token'); // fencing
       expect(events.emit).toHaveBeenCalledWith('message.updated', { message: failed });
     });
 
-    it('deferRetry parks a 429 message with retry_after_until merged into meta (token-fenced)', async () => {
+    it('deferRetry parks a 429 message with retry_after_until merged into meta and CLEARS the computed backoff (token-fenced)', async () => {
       const parked = mkMessage({ id: 'm-1', meta: { model: 'x' } });
       repo.query.mockResolvedValueOnce([parked]);
 
@@ -574,6 +642,7 @@ describe('MessagesService', () => {
       expect(result).toBe(parked);
       const [sql, params] = repo.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain("'retry_after_until'");
+      expect(sql).toContain('next_attempt_at = NULL'); // the Telegram signal wins
       expect(sql).toContain('COALESCE(meta'); // meta MERGE — model/claim_token survive
       expect(params[0]).toBe('m-1');
       expect(params[1]).toContain('retry after 30s');

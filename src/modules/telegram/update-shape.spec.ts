@@ -39,6 +39,45 @@ describe('isValidUpdateShape (webhook input validation — review fix #4-c)', ()
     expect(isValidUpdateShape(payload)).toBe(false);
   });
 
+  describe('review round 5 fix #3 — chat is REQUIRED whenever a message exists', () => {
+    it('rejects a message WITHOUT chat entirely (previously entered the inbox and failed processing)', () => {
+      expect(
+        isValidUpdateShape({ update_id: 110, message: { message_id: 1, text: 'سلام' } }),
+      ).toBe(false);
+    });
+
+    it('rejects a chat that is not an object', () => {
+      expect(
+        isValidUpdateShape({ update_id: 111, message: { message_id: 1, chat: 'x' } }),
+      ).toBe(false);
+    });
+
+    it('rejects a chat with a non-scalar id', () => {
+      expect(
+        isValidUpdateShape({ update_id: 112, message: { message_id: 1, chat: { id: { x: 1 }, type: 'private' } } }),
+      ).toBe(false);
+    });
+
+    it('rejects a chat without a type (the orchestrator relies on it for the private-chat filter)', () => {
+      expect(
+        isValidUpdateShape({ update_id: 113, message: { message_id: 1, chat: { id: 111 } } }),
+      ).toBe(false);
+    });
+
+    it('accepts a STRING chat id (Telegram uses strings for some chat kinds)', () => {
+      expect(
+        isValidUpdateShape({
+          update_id: 114,
+          message: { message_id: 1, chat: { id: '111', type: 'private' }, text: 'سلام' },
+        }),
+      ).toBe(true);
+    });
+
+    it('still accepts valid-but-ignored shapes without a message (edited_message etc.)', () => {
+      expect(isValidUpdateShape({ update_id: 115, edited_message: { message_id: 1 } })).toBe(true);
+    });
+  });
+
   it('rejects oversized payloads (jsonb sanity limit)', () => {
     const huge = validUpdate();
     (huge.message as Record<string, unknown>).text = 'x'.repeat(70_000);

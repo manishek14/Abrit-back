@@ -120,6 +120,12 @@ export const RawEnvSchema = z
     TELEGRAM_WEBHOOK_URL: z.string().default(''),
     TELEGRAM_WEBHOOK_SECRET: z.string().default(''),
     TELEGRAM_ALLOWED_UPDATES: z.string().default('message'),
+    // Review round 5 fix #2: outbound Telegram requests fail fast as TRANSIENT
+    // when hung. MUST stay below the 60 s delivery lease (DELIVERY_LEASE_MS) —
+    // a request that could outlive its lease is exactly the double-send window
+    // the fencing fix closes. Enforced by a unit test + gateway behavior; the
+    // 120 s max here keeps absurd values out.
+    TELEGRAM_SEND_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(30_000),
 
     // --- AI / OpenRouter (EMPTY = disabled, fixed fallback reply) ---
     OPENROUTER_API_KEY: z.string().default(''),
