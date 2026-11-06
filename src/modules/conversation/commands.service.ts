@@ -16,7 +16,6 @@ import {
 import {
   GENERIC_CANCELED,
   REG_REQUIRED,
-  WIZARD_CANCELED,
   helpText,
   profileCard,
   trackCard,
