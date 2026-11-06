@@ -893,6 +893,14 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     await postUpdate(first);
     await assistantSent(1);
 
+    // wait for the update to FULLY finish (markDone included) before
+    // simulating the crash — otherwise markDone races this flip and the
+    // artificial PROCESSING state is overwritten back to DONE
+    await waitFor(async () => {
+      const rows = await ds.query(`SELECT status FROM bot_updates`);
+      return rows.every((r: { status: string }) => r.status === 'DONE');
+    });
+
     // simulate a crash AFTER message 1 was stored: its reply is gone and the
     // row sits in stale PROCESSING — the sweeper will retry it, but until then
     // it has NOT reached a terminal state
