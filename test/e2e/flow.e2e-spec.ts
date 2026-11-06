@@ -543,6 +543,135 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     await authed(request(app.getHttpServer()).get(`${api}?limit=0`)).expect(400);
   });
 
+  it('PAGINATION (P0 fix): a long conversation lands on the NEWEST slice; load-older walks backward', async () => {
+    const [user] = await ds.query(
+      `INSERT INTO telegram_users (telegram_id, chat_id) VALUES ('950410', '950410') RETURNING *`,
+    );
+    const [ticket] = await ds.query(
+      `INSERT INTO tickets (user_id, subject) VALUES ($1, 'صفحه‌بندی جدید') RETURNING *`,
+      [user.id],
+    );
+    for (let i = 1; i <= 12; i++) {
+      await ds.query(
+        `INSERT INTO messages (ticket_id, role, content) VALUES ($1, 'USER', $2)`,
+        [ticket.id, `پیام ${i}`],
+      );
+    }
+    const ids = (await ds.query(`SELECT id FROM messages ORDER BY id`)).map(
+      (r: { id: string }) => r.id,
+    );
+    const api = `/api/tickets/${ticket.id}/messages`;
+
+    // initial page (no cursor): the LATEST 5, ascending — the agent sees the
+    // conversation's newest state first, and has_more points at older history.
+    const first = await authed(request(app.getHttpServer()).get(`${api}?limit=5`)).expect(200);
+    expect(first.body.data.map((m: { id: string }) => m.id)).toEqual(ids.slice(7, 12));
+    expect(first.body.meta.has_more).toBe(true);
+
+    // "load older" with the oldest cached id prepends the 5 messages before it
+    const older = await authed(
+      request(app.getHttpServer()).get(`${api}?before=${ids[7]}&limit=5`),
+    ).expect(200);
+    expect(older.body.data.map((m: { id: string }) => m.id)).toEqual(ids.slice(2, 7));
+    expect(older.body.meta.has_more).toBe(true);
+
+    // the last older page is short and reports has_more = false
+    const last = await authed(
+      request(app.getHttpServer()).get(`${api}?before=${ids[2]}&limit=5`),
+    ).expect(200);
+    expect(last.body.data.map((m: { id: string }) => m.id)).toEqual(ids.slice(0, 2));
+    expect(last.body.meta.has_more).toBe(false);
+
+    // after-cursor still refreshes incrementally (newer than the cursor)
+    const fresh = await authed(
+      request(app.getHttpServer()).get(`${api}?after=${ids[10]}`),
+    ).expect(200);
+    expect(fresh.body.data.map((m: { id: string }) => m.id)).toEqual(ids.slice(11, 12));
+  });
+
+  it('ADMIN REPLY: panel reply → ADMIN outbox row → Telegram delivery + realtime badges + last-activity bump', async () => {
+    await postUpdate(messageUpdate(950800, 'سلام، منتظر پاسخ هستم'));
+    await assistantSent(1);
+
+    const [ticket] = await ds.query(`SELECT id, last_message_at FROM tickets`);
+    const before = new Date(ticket.last_message_at as string);
+
+    // realtime: the panel must see the reply the moment it commits and its
+    // delivery badge when the outbox finishes the send.
+    const url = await app.getUrl();
+    const socket = socketIoClient(url, { auth: { token }, transports: ['websocket'] });
+    const nextEvent = (event: string, timeoutMs = 5000): Promise<Record<string, unknown>> =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for ${event}`)), timeoutMs);
+        socket.once(event, (payload: Record<string, unknown>) => {
+          clearTimeout(timer);
+          resolve(payload);
+        });
+      });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', () => resolve());
+        socket.once('connect_error', (err: Error) => reject(err));
+      });
+
+      const messageEvent = nextEvent('message:new');
+      const sentEvent = nextEvent('message:updated');
+
+      const res = await authed(
+        request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({
+          content: '  پاسخ کارشناس  ',
+        }),
+      ).expect(201);
+      expect(res.body.data).toMatchObject({
+        role: 'ADMIN',
+        content: 'پاسخ کارشناس', // trimmed
+        delivery_status: 'PENDING',
+      });
+      expect(typeof res.body.data.admin_id).toBe('string');
+
+      await expect(messageEvent).resolves.toMatchObject({
+        message: { role: 'ADMIN', content: 'پاسخ کارشناس', delivery_status: 'PENDING' },
+      });
+      await expect(sentEvent).resolves.toMatchObject({
+        message: { role: 'ADMIN', delivery_status: 'SENT' },
+      });
+
+      // the durable outbox delivered the reply to the user's chat exactly once
+      expect(fakeGateway.sent.filter((s) => s.text === 'پاسخ کارشناس')).toHaveLength(1);
+
+      // ticket's last-activity stamp advanced in the same transaction
+      const [afterTicket] = await ds.query(
+        `SELECT last_message_at FROM tickets WHERE id = $1`,
+        [ticket.id],
+      );
+      expect(new Date(afterTicket.last_message_at as string).getTime()).toBeGreaterThan(
+        before.getTime() - 1,
+      );
+    } finally {
+      socket.close();
+    }
+
+    // input validation
+    await authed(
+      request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({ content: '' }),
+    ).expect(400);
+    await authed(
+      request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({ content: 'x'.repeat(4001) }),
+    ).expect(400);
+    await authed(
+      request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({}),
+    ).expect(400);
+
+    // a CLOSED ticket refuses new replies with 409 — reopen first
+    await authed(
+      request(app.getHttpServer()).patch(`/api/tickets/${ticket.id}/status`).send({ status: 'CLOSED' }),
+    ).expect(200);
+    await authed(
+      request(app.getHttpServer()).post(`/api/tickets/${ticket.id}/messages`).send({ content: 'بعد از بستن' }),
+    ).expect(409);
+  });
+
   it('VALIDATION: /users/:id rejects non-uuid with 400; ticket list embeds the owner', async () => {
     await authed(request(app.getHttpServer()).get('/api/users/not-a-uuid')).expect(400);
 

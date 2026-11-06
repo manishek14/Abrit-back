@@ -127,8 +127,14 @@ describe('TicketsService', () => {
       expect(manager.update).toHaveBeenCalledWith(
         Ticket,
         't-1',
-        expect.objectContaining({ status: TicketStatus.IN_PROGRESS, closed_at: null }),
+        expect.objectContaining({
+          status: TicketStatus.IN_PROGRESS,
+          closed_at: null,
+          // review fix #5: the SYSTEM message bumps the list's sort key too
+          last_message_at: expect.any(Date),
+        }),
       );
+      expect(res.ticket.last_message_at).toEqual(expect.any(Date));
       expect(res.systemMessage?.role).toBe(MessageRole.SYSTEM);
       expect(res.systemMessage?.delivery_status).toBe(DeliveryStatus.PENDING);
       expect(res.systemMessage?.content).toContain('در حال بررسی');

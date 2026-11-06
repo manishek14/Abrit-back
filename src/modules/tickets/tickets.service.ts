@@ -131,10 +131,15 @@ export class TicketsService {
         }
 
         const previousStatus = ticket.status;
+        const now = new Date();
         await manager.update(Ticket, ticket.id, {
           status: newStatus,
-          closed_at: newStatus === TicketStatus.CLOSED ? new Date() : null,
-          updated_at: new Date(),
+          closed_at: newStatus === TicketStatus.CLOSED ? now : null,
+          updated_at: now,
+          // Review fix #5: the status change ALSO appends a SYSTEM message to
+          // the conversation — the ticket's last-activity stamp (which the list
+          // is sorted by) must reflect it, in the SAME transaction.
+          last_message_at: now,
         });
 
         const content =
@@ -154,8 +159,9 @@ export class TicketsService {
         const updatedTicket: Ticket = {
           ...ticket,
           status: newStatus,
-          closed_at: newStatus === TicketStatus.CLOSED ? new Date() : null,
-          updated_at: new Date(),
+          closed_at: newStatus === TicketStatus.CLOSED ? now : null,
+          updated_at: now,
+          last_message_at: now,
         };
 
         // Deferred until the transaction has actually committed (fix #3).

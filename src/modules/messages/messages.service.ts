@@ -1,5 +1,5 @@
 import { ConflictException, Injectable } from '@nestjs/common';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, EntityManager, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Message } from '../../database/entities/message.entity';
 import { Ticket } from '../../database/entities/ticket.entity';
@@ -13,6 +13,12 @@ export const MAX_DELIVERY_ATTEMPTS = 5;
 
 /** Delivery lease: a claimed message cannot be re-claimed for this long (review fix #2). */
 export const DELIVERY_LEASE_MS = 60_000;
+
+/** Initial conversation page size (review fix: agents land on the NEWEST slice). */
+export const INITIAL_PAGE_SIZE = 50;
+
+/** Hard cap for any conversation page (controller DTO mirrors this). */
+export const MAX_PAGE_SIZE = 1000;
 
 export interface AddUserMessageInput {
   ticket_id: string;
@@ -39,6 +45,29 @@ export class MessagesService {
   ) {}
 
   /**
+   * THE MESSAGE-CREATION CONTRACT — every path that stores a message follows
+   * exactly one shape (review fix #6):
+   *   1. the message row AND ticket.last_message_at commit in ONE transaction;
+   *   2. the `message.created` event fires only AFTER that commit, so the
+   *      outbox dispatcher and the panel never see data that could still roll
+   *      back (they would otherwise deliver a phantom message);
+   *   3. every creation route is idempotent (unique dedup + resume), so the
+   *      sweeper can always finish half-done work.
+   */
+  private async persistWithTouch(
+    create: (manager: EntityManager) => Promise<Message>,
+    ticketId: string,
+  ): Promise<Message> {
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const message = await create(manager);
+      await manager.update(Ticket, ticketId, { last_message_at: new Date() });
+      return message;
+    });
+    this.events.emit('message.created', { message: saved });
+    return saved;
+  }
+
+  /**
    * Stores a user message and touches ticket.last_message_at.
    *
    * RESUME semantics (review fix #1): a unique violation on telegram_update_id
@@ -46,26 +75,38 @@ export class MessagesService {
    * finishing (ingest dedups update_id; claim dedups concurrent workers). So
    * instead of failing we return the existing row and let the caller continue
    * with the reply step — half-finished work is resumed, never dropped.
+   *
+   * The resumed message also gets its ticket touch and its `message.created`
+   * event (review fix #5): the previous attempt may have died before the event
+   * went out, so a panel watching the ticket could have missed the message.
+   * Both are idempotent — the panel merges by message id, the touch just bumps
+   * a timestamp — so re-firing them can never cause a duplicate.
    */
   async addUserMessage(input: AddUserMessageInput): Promise<Message> {
     try {
-      const saved = await this.repo.save(
-        this.repo.create({
-          ticket_id: input.ticket_id,
-          role: MessageRole.USER,
-          content: input.content,
-          telegram_update_id: input.telegram_update_id ?? null,
-        }),
+      return await this.persistWithTouch(
+        (manager) =>
+          manager.save(
+            Message,
+            manager.create(Message, {
+              ticket_id: input.ticket_id,
+              role: MessageRole.USER,
+              content: input.content,
+              telegram_update_id: input.telegram_update_id ?? null,
+            }),
+          ),
+        input.ticket_id,
       );
-      await this.touchTicket(input.ticket_id);
-      this.events.emit('message.created', { message: saved });
-      return saved;
     } catch (e) {
       if (isUniqueViolation(e) && input.telegram_update_id) {
         const existing = await this.repo.findOne({
           where: { telegram_update_id: input.telegram_update_id },
         });
-        if (existing) return existing; // crash resume — no event, no touch
+        if (existing) {
+          await this.touchTicket(input.ticket_id);
+          this.events.emit('message.created', { message: existing });
+          return existing;
+        }
       }
       if (isUniqueViolation(e)) {
         throw new ConflictException('Duplicate user message for this telegram update');
@@ -89,20 +130,22 @@ export class MessagesService {
    */
   async addOutboundMessage(input: AddOutboundMessageInput): Promise<Message> {
     try {
-      const saved = await this.repo.save(
-        this.repo.create({
-          ticket_id: input.ticket_id,
-          role: input.role,
-          content: input.content,
-          in_reply_to_id: input.in_reply_to_id ?? null,
-          admin_id: input.admin_id ?? null,
-          meta: input.meta ?? null,
-          delivery_status: DeliveryStatus.PENDING,
-        }),
+      return await this.persistWithTouch(
+        (manager) =>
+          manager.save(
+            Message,
+            manager.create(Message, {
+              ticket_id: input.ticket_id,
+              role: input.role,
+              content: input.content,
+              in_reply_to_id: input.in_reply_to_id ?? null,
+              admin_id: input.admin_id ?? null,
+              meta: input.meta ?? null,
+              delivery_status: DeliveryStatus.PENDING,
+            }),
+          ),
+        input.ticket_id,
       );
-      await this.touchTicket(input.ticket_id);
-      this.events.emit('message.created', { message: saved });
-      return saved;
     } catch (e) {
       if (isUniqueViolation(e)) {
         throw new ConflictException('An assistant reply for this message already exists');
@@ -112,17 +155,47 @@ export class MessagesService {
   }
 
   /**
-   * Conversation history in order.
-   * `after` — cheap incremental refresh by last seen id (returns newer).
-   * `before` — backward pagination for older history (returns the `limit`
-   *            messages immediately older than the cursor, still ascending).
-   * `has_more` — whether more (older) messages exist beyond this page.
+   * Operator reply from the panel (review fix #4). Stored as a PENDING outbox
+   * row with admin_id recorded; the dispatcher delivers it to Telegram exactly
+   * like assistant replies and `message.updated` events flip the panel's
+   * delivery badge to SENT/FAILED in realtime.
+   */
+  async addAdminMessage(input: {
+    ticket_id: string;
+    content: string;
+    admin_id: string;
+  }): Promise<Message> {
+    return this.persistWithTouch(
+      (manager) =>
+        manager.save(
+          Message,
+          manager.create(Message, {
+            ticket_id: input.ticket_id,
+            role: MessageRole.ADMIN,
+            content: input.content,
+            admin_id: input.admin_id,
+            delivery_status: DeliveryStatus.PENDING,
+          }),
+        ),
+      input.ticket_id,
+    );
+  }
+
+  /**
+   * Conversation history in chronological order (review fix: the agent lands on
+   * the conversation's LATEST messages, older history is paged in on demand).
+   *   no cursor   — the LAST `limit` messages (initial page); has_more = older
+   *                 messages exist above the page (→ the "load older" button).
+   *   after=<id>  — incremental refresh: messages NEWER than the cursor,
+   *                 ascending; has_more = newer messages exist beyond the page.
+   *   before=<id> — backward pagination: the `limit` messages immediately OLDER
+   *                 than the cursor, ascending; has_more = older ones remain.
    */
   async getConversationPage(
     ticket_id: string,
     options: { after?: string; before?: string; limit?: number } = {},
   ): Promise<{ messages: Message[]; has_more: boolean }> {
-    const limit = Math.min(options.limit ?? 1000, 1000);
+    const limit = Math.min(options.limit ?? INITIAL_PAGE_SIZE, MAX_PAGE_SIZE);
 
     if (options.before) {
       const rows = await this.repo
@@ -136,19 +209,27 @@ export class MessagesService {
       return { messages: rows.slice(0, limit).reverse(), has_more };
     }
 
-    const qb = this.repo
-      .createQueryBuilder('m')
-      .where('m.ticket_id = :ticket_id', { ticket_id })
-      .orderBy('m.id', 'ASC')
-      .take(limit + 1);
-
     if (options.after) {
-      qb.andWhere('m.id > :after', { after: options.after });
+      const rows = await this.repo
+        .createQueryBuilder('m')
+        .where('m.ticket_id = :ticket_id', { ticket_id })
+        .andWhere('m.id > :after', { after: options.after })
+        .orderBy('m.id', 'ASC')
+        .take(limit + 1)
+        .getMany();
+      const has_more = rows.length > limit;
+      return { messages: rows.slice(0, limit), has_more };
     }
 
-    const rows = await qb.getMany();
+    // Initial page: the NEWEST `limit` messages, returned ascending.
+    const rows = await this.repo
+      .createQueryBuilder('m')
+      .where('m.ticket_id = :ticket_id', { ticket_id })
+      .orderBy('m.id', 'DESC')
+      .take(limit + 1)
+      .getMany();
     const has_more = rows.length > limit;
-    return { messages: rows.slice(0, limit), has_more };
+    return { messages: rows.slice(0, limit).reverse(), has_more };
   }
 
   /** The LAST `limit` messages in chronological order — the AI context source for a ticket. */
