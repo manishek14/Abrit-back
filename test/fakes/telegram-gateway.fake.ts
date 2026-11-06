@@ -15,6 +15,12 @@ export class FakeTelegramGateway implements TelegramGateway {
   private counter = 100_000;
   /** Recorded answerCallbackQuery calls (my-tickets inline keyboards). */
   public answeredCallbacks: { id: string; text?: string }[] = [];
+  /** Recorded editMessageText calls (chatbot waiting → answer, request §5). */
+  public edits: { chat_id: string; message_id: string; text: string }[] = [];
+  /** When set, the next editMessageText rejects (fallback-path tests). */
+  public failNextEdit = false;
+  /** message_ids returned by successful sends — correlates waiting ↔ edit. */
+  public sentIds: string[] = [];
 
   async sendMessage(params: SendMessageParams): Promise<{ message_id: string }> {
     if (this.errorQueue.length > 0) {
@@ -25,7 +31,9 @@ export class FakeTelegramGateway implements TelegramGateway {
       throw new TelegramApiError('simulated telegram failure', 500, false);
     }
     this.sent.push(params);
-    return { message_id: String(this.counter++) };
+    const id = String(this.counter++);
+    this.sentIds.push(id);
+    return { message_id: id };
   }
 
   setUpdateHandler(_handler: (update: RawTelegramUpdate) => Promise<void>): void {
@@ -34,6 +42,18 @@ export class FakeTelegramGateway implements TelegramGateway {
 
   async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
     this.answeredCallbacks.push({ id: callbackQueryId, text });
+  }
+
+  async editMessageText(params: {
+    chat_id: string;
+    message_id: string;
+    text: string;
+  }): Promise<void> {
+    if (this.failNextEdit) {
+      this.failNextEdit = false;
+      throw new TelegramApiError('simulated edit failure', 400, true);
+    }
+    this.edits.push(params);
   }
 
   /** Queues a TelegramApiError for the NEXT send(s) — e.g. a 403 to simulate
@@ -47,5 +67,8 @@ export class FakeTelegramGateway implements TelegramGateway {
     this.failNext = false;
     this.errorQueue = [];
     this.answeredCallbacks = [];
+    this.edits = [];
+    this.failNextEdit = false;
+    this.sentIds = [];
   }
 }

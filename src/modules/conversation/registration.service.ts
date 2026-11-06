@@ -49,11 +49,15 @@ export class RegistrationService {
     return this.usersService.isProfileComplete(user);
   }
 
-  /** (Re)starts registration at step 1. Also the landing for gated users. */
-  async start(user: TelegramUser, chatId: string, opts: { gated?: boolean } = {}): Promise<void> {
+  /**
+   * (Re)starts registration at step 1 — the entry for /start, /profile (when
+   * incomplete), the gate keyboard's «تکمیل پروفایل» button and the edit card.
+   * ALWAYS sends only the welcome: any restriction message is sent by the
+   * GATE (commands/flow-router) BEFORE the user chooses to enter (§1/§2).
+   */
+  async start(user: TelegramUser, chatId: string): Promise<void> {
     await this.botState.set(user.id, 'REGISTER_NAME');
-    const text = opts.gated ? `${REG_REQUIRED}\n\n${REG_WELCOME}` : REG_WELCOME;
-    await sendEphemeral(this.gateway, chatId, text, this.logger, {
+    await sendEphemeral(this.gateway, chatId, REG_WELCOME, this.logger, {
       reply_markup: registrationNameKeyboard(),
     });
   }

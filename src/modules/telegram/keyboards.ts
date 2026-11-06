@@ -52,9 +52,25 @@ export function mainMenuKeyboard(): ReplyKeyboard {
   };
 }
 
+// ── profile gate (request §2) ────────────────────────────────────────────────
+export const BTN_COMPLETE_PROFILE = '👤 تکمیل پروفایل';
+
+/**
+ * THE gate keyboard: the ONLY reply keyboard a user without a completed
+ * profile may ever see after touching a protected feature — one button, no
+ * escape into main features (the router enforces the same rule server-side).
+ */
+export function profileGateKeyboard(): ReplyKeyboard {
+  return {
+    keyboard: [[{ text: BTN_COMPLETE_PROFILE }]],
+    resize_keyboard: true,
+  };
+}
+
 // ── registration ─────────────────────────────────────────────────────────────
 export const BTN_REG_BACK = '🔙 بازگشت';
 export const BTN_SHARE_CONTACT = '📱 ارسال شماره همراه من';
+export const BTN_EDIT_PROFILE = '✏️ ویرایش اطلاعات';
 
 /** Step 1 (name) takes free text — the keyboard is removed to signal that. */
 export function registrationNameKeyboard(): RemoveKeyboard {
@@ -127,6 +143,23 @@ export function ticketViewKeyboard(): ReplyKeyboard {
     ],
     resize_keyboard: true,
   };
+}
+
+// ── chatbot mode (request §4/§5) ─────────────────────────────────────────────
+export const BTN_CHATBOT_EXIT = '🔙 بازگشت به منوی اصلی';
+
+/** Chatbot mode: one exit button — everything else typed here is AI input. */
+export function chatbotKeyboard(): ReplyKeyboard {
+  return {
+    keyboard: [[{ text: BTN_CHATBOT_EXIT }]],
+    resize_keyboard: true,
+  };
+}
+
+/** The /profile card: main menu + the edit entry (edit = re-run registration). */
+export function profileCardKeyboard(): ReplyKeyboard {
+  const menu = mainMenuKeyboard().keyboard;
+  return { keyboard: [...menu, [{ text: BTN_EDIT_PROFILE }]], resize_keyboard: true };
 }
 
 // ── my tickets inline list ───────────────────────────────────────────────────

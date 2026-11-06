@@ -5,9 +5,12 @@ import {
   departmentKeyboard,
   mainMenuKeyboard,
   myTicketsInlineKeyboard,
+  profileCardKeyboard,
+  profileGateKeyboard,
   registrationPhoneKeyboard,
   ticketCancelKeyboard,
   ticketViewKeyboard,
+  chatbotKeyboard,
   MYT_PAGE_SIZE,
 } from './keyboards';
 import { TicketDepartment } from '../../database/enums';
@@ -89,5 +92,22 @@ describe('keyboard factory (feature §5)', () => {
   it('single-page lists get no navigation row', () => {
     const kb = myTicketsInlineKeyboard([{ id: 't1', subject: 'عنوان', ticket_number: 'TKT-1' }], 1, 1);
     expect(kb.inline_keyboard).toHaveLength(1);
+  });
+
+  it('§2: the profile-gate keyboard shows ONLY «تکمیل پروفایل»', () => {
+    const kb = profileGateKeyboard();
+    expect(kb.keyboard.flat().map((b) => b.text)).toEqual(['👤 تکمیل پروفایل']);
+  });
+
+  it('§4: the chatbot keyboard shows ONLY the exit button', () => {
+    const kb = chatbotKeyboard();
+    expect(kb.keyboard.flat().map((b) => b.text)).toEqual(['🔙 بازگشت به منوی اصلی']);
+  });
+
+  it('§6: the profile card keyboard = main menu + the edit entry', () => {
+    const kb = profileCardKeyboard();
+    const texts = kb.keyboard.flat().map((b) => b.text);
+    expect(texts.slice(0, 5)).toEqual(mainMenuKeyboard().keyboard.flat().map((b) => b.text));
+    expect(texts).toContain('✏️ ویرایش اطلاعات');
   });
 });

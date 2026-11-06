@@ -33,18 +33,40 @@ export const REG_DONE =
 export const REG_REQUIRED =
   'برای استفاده از امکانات ربات ابتدا باید پروفایل خود را تکمیل کنید.';
 
+export const GENERIC_CANCELED = 'عملیات جاری لغو شد.';
+
+// ── chatbot mode (request §4/§5) ─────────────────────────────────────────────
+export const CHATBOT_INTRO =
+  'به دستیار هوشمند ABRIT خوش آمدید. سؤال خود را ارسال کنید.';
+
+/** The EXACT waiting text required by request §5 — sent BEFORE OpenRouter. */
+export const CHATBOT_WAITING =
+  'Chatbot is working on your request. Please wait a moment.';
+
+export const CHATBOT_ERROR =
+  '⚠️ متأسفانه در پردازش درخواست شما خطایی رخ داد. لطفاً دوباره سؤال خود را ارسال کنید.';
+
+export const CHATBOT_LEFT =
+  'از حالت گفت‌وگو با دستیار هوشمند خارج شدید. از منوی زیر انتخاب کنید.';
+
+/** Telegram hard limit for one message — long AI answers are split (§5). */
+export const TELEGRAM_MESSAGE_MAX_CHARS = 4096;
+
 // ── profile / track ──────────────────────────────────────────────────────────
+/**
+ * The /profile card (request §6): EXACTLY نام و نام خانوادگی + شماره همراه —
+ * the Telegram username is deliberately NOT part of the user-facing profile
+ * model (it stays a technical column for the admin panel only).
+ */
 export function profileCard(user: {
   full_name: string | null;
   phone: string | null;
-  username: string | null;
 }): string {
   return [
     '👤 پروفایل شما',
     '',
     `نام و نام خانوادگی: ${user.full_name ?? '—'}`,
     `شماره همراه: ${user.phone ?? '—'}`,
-    `یوزرنیم: ${user.username ? '@' + user.username : '—'}`,
   ].join('\n');
 }
 
@@ -67,6 +89,7 @@ export function helpText(): string {
     '/status — پیگیری تیکت',
     '/close — بستن تیکت فعال',
     '/cancel — لغو فرایند جاری',
+    '/chatbot — گفت‌وگو با دستیار هوشمند',
     '/help — همین راهنما',
     '',
     'دکمه‌های منوی اصلی:',
@@ -75,7 +98,7 @@ export function helpText(): string {
     '🔍 پیگیری تیکت — وضعیت آخرین تیکت',
     '👤 پروفایل من — اطلاعات پروفایل',
     '',
-    'همچنین می‌توانید سؤال عمومی خود را مستقیم بپرسید تا دستیار هوشمند ABRIT پاسخ دهد.',
+    'برای گفت‌وگو با دستیار هوشمند ABRIT دستور /chatbot را بزنید.',
   ].join('\n');
 }
 

@@ -68,9 +68,9 @@ describe('RegistrationService (feature §1 — پروفایل اجباری)', ()
     expect(call.reply_markup).toEqual({ remove_keyboard: true });
   });
 
-  it('start with {gated} prefixes the "profile required" warning', async () => {
-    await service.start(mkUser(), '555', { gated: true });
-    expect(gateway.sendMessage.mock.calls[0][0].text).toContain('ابتدا باید پروفایل');
+  it('start NEVER prefixes a restriction message — the gate owns it (§1/§2)', async () => {
+    await service.start(mkUser(), '555');
+    expect(gateway.sendMessage.mock.calls[0][0].text).not.toContain('باید پروفایل');
   });
 
   it('handleText: valid name → REGISTER_PHONE + the phone keyboard (request_contact)', async () => {

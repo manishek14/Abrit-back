@@ -60,7 +60,8 @@ export class BotStateService {
     await this.usersService.setBotState(userId, null);
   }
 
-  /** Appends one turn to the general-chat history (capped, oldest dropped). */
+  /** Appends one turn to the general-chat history (capped, oldest dropped).
+   *  The chatbot's last_update_id dedup marker survives the append. */
   withChatTurn(
     state: BotFlowState | null,
     userText: string,
@@ -71,7 +72,10 @@ export class BotStateService {
       { r: 'u' as const, c: clip(userText) },
       { r: 'a' as const, c: clip(assistantText) },
     ].slice(-CHAT_HISTORY_MAX_ENTRIES);
-    return { flow: 'CHAT', data: { history } };
+    return {
+      flow: 'CHAT',
+      data: { history, last_update_id: state?.data?.last_update_id },
+    };
   }
 }
 

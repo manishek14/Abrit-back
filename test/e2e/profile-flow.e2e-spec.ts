@@ -211,20 +211,53 @@ describe('ABRIT feature flows (profile → wizard → mytickets → AI chat)', (
     expect(u.profile_completed_at).toBeNull();
   });
 
-  it('scenario 4/9.3: EVERY main feature is gated behind the profile', async () => {
-    // /mytickets and /new answer with the profile-required notice…
-    for (const text of ['/mytickets', '/new']) {
+  it('scenario 4/9.3: EVERY protected feature is gated (§2) — restriction + «تکمیل پروفایل»-ONLY keyboard, no bypass', async () => {
+    // /mytickets and /new answer with the restriction + the gate keyboard…
+    for (const text of ['/mytickets', '/new', '🎫 ثبت تیکت جدید', 'یه پیام معمولی']) {
       await postUpdate(messageUpdate(810006, text));
       await waitForSent('پروفایل');
+      const gate = lastSent();
+      expect(gate.text).toContain('ابتدا باید پروفایل');
+      const kb = gate.reply_markup as { keyboard: { text: string }[][] };
+      expect(kb.keyboard.flat().map((b) => b.text)).toEqual(['👤 تکمیل پروفایل']);
       clearSent();
     }
-    // …and a plain text lands in the REGISTRATION flow (invalid name → error,
-    // state stays REGISTER_NAME — never the AI chat, never a ticket)
-    await postUpdate(messageUpdate(810006, 'سلام'));
-    await waitForSent('معتبر نیست');
+    // a plain text does NOT auto-start registration anymore — the gate
+    // keyboard is the only way forward (the user opts in)
     const [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810006'`);
-    expect(state.bot_state.flow).toBe('REGISTER_NAME');
+    expect(state.bot_state).toBeNull();
     expect(await count('tickets')).toBe(0);
+  });
+
+  it('scenario 4b (§2): the gate keyboard click starts registration; /profile enters it directly WITHOUT any restriction message', async () => {
+    // /profile with an INCOMPLETE profile → the flow starts directly (§1)
+    await postUpdate(messageUpdate(810017, '/profile'));
+    await waitForSentFor(810017, 'خوش آمدید');
+    expect(findSent('خوش آمدید').text).not.toContain('ابتدا باید پروفایل');
+    let [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810017'`);
+    expect(state.bot_state.flow).toBe('REGISTER_NAME');
+    clearSent();
+
+    // …and the gate-keyboard button does the same for a gated user (§2)
+    await postUpdate(messageUpdate(810018, '🎫 ثبت تیکت جدید'));
+    await waitForSentFor(810018, 'ابتدا باید پروفایل');
+    clearSent();
+    await postUpdate(messageUpdate(810018, '👤 تکمیل پروفایل'));
+    await waitForSentFor(810018, 'خوش آمدید');
+    [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810018'`);
+    expect(state.bot_state.flow).toBe('REGISTER_NAME');
+    clearSent();
+
+    // completing the profile restores the MAIN menu keyboard (§2.4)
+    await postUpdate(messageUpdate(810018, 'محمدرضا کریمی'));
+    await waitForSentFor(810018, 'شماره همراه');
+    clearSent();
+    await postUpdate(messageUpdate(810018, '09121112233'));
+    await waitForSentFor(810018, 'پروفایل شما تکمیل شد');
+    const done = lastSent();
+    const kb = done.reply_markup as { keyboard: { text: string }[][] };
+    expect(kb.keyboard.flat().map((b) => b.text)).toContain('🎫 ثبت تیکت جدید');
+    expect(kb.keyboard.flat().map((b) => b.text)).not.toContain('👤 تکمیل پروفایل');
   });
 
   /* ---------------- §9.4–6: wizard + confirmation ---------------- */
@@ -393,12 +426,120 @@ describe('ABRIT feature flows (profile → wizard → mytickets → AI chat)', (
 
   /* ---------------- §9.11/13: general AI chat + degradation ---------------- */
 
-  it('scenario 11/12/13: plain text → OpenRouter chat (fallback here, NO ticket, NO ticket-handler leak)', async () => {
+  it('scenario 11/12/13: plain text → chatbot pipeline (waiting → provider → edit); fallback reads as an ERROR, never a ticket', async () => {
     await register(810014);
     await postUpdate(messageUpdate(810014, 'سلام، ربات چطور کار می‌کند؟'));
-    await waitForSent('پیام شما ثبت شد'); // honest fallback (key empty in e2e)
+    // §5 step 2: the waiting message ALWAYS precedes the provider wait
+    await waitForSent('Chatbot is working on your request');
+    const waitingIdx = fakeGateway.sent.findIndex((s) => s.text.includes('Chatbot is working'));
+    // the e2e key is empty → the fallback → the §5 understandable error lands
+    // via editMessageText ON the waiting message (same id — edited in place)
+    await waitFor(() => fakeGateway.edits.length > 0);
+    expect(fakeGateway.edits.at(-1)).toMatchObject({
+      chat_id: '810014',
+      message_id: fakeGateway.sentIds[waitingIdx],
+    });
+    expect(fakeGateway.edits.at(-1)!.text).toContain('خطایی رخ داد');
     expect(await count('tickets')).toBe(0);
     expect(await count('messages')).toBe(0); // general chat is ephemeral by design
+
+    // §5: the user can simply RETRY after the error
+    clearSent();
+    fakeGateway.edits = [];
+    await postUpdate(messageUpdate(810014, 'سؤال دوم'));
+    await waitForSent('Chatbot is working on your request');
+    await waitFor(() => fakeGateway.edits.length > 0);
+    expect(fakeGateway.edits.at(-1)!.text).toContain('خطایی رخ داد');
+  });
+
+  /* ---------------- request §4/§5: chatbot MODE ---------------- */
+
+  it('§4: /chatbot without a profile is gated (restriction + gate keyboard); /chatbot with one ENTERS the mode', async () => {
+    // gated → restriction, never the intro
+    await postUpdate(messageUpdate(810020, '/chatbot'));
+    await waitForSentFor(810020, 'ابتدا باید پروفایل');
+    expect(lastSent().text).not.toContain('دستیار هوشمند');
+    clearSent();
+
+    // registered → intro + chatbot-only keyboard, NO help guide (§7 separation)
+    await register(810021);
+    clearSent();
+    await postUpdate(messageUpdate(810021, '/chatbot'));
+    await waitForSentFor(810021, 'دستیار هوشمند ABRIT خوش آمدید');
+    const intro = lastSent();
+    expect(intro.text).toContain('سؤال خود را ارسال کنید');
+    const kb = intro.reply_markup as { keyboard: { text: string }[][] };
+    expect(kb.keyboard.flat().map((b) => b.text)).toEqual(['🔙 بازگشت به منوی اصلی']);
+
+    const [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810021'`);
+    expect(state.bot_state.flow).toBe('CHAT');
+  });
+
+  it('§4/§5: in chatbot mode EVERY plain text goes to the AI — even menu-button labels — and the waiting message precedes the answer', async () => {
+    await register(810022);
+    clearSent();
+    await postUpdate(messageUpdate(810022, '/chatbot'));
+    await waitForSentFor(810022, 'دستیار هوشمند');
+    clearSent();
+
+    // a menu-button label inside chat mode is AI input, NOT a ticket action
+    await postUpdate(messageUpdate(810022, '🎫 ثبت تیکت جدید'));
+    await waitForSent('Chatbot is working on your request');
+    await waitFor(() => fakeGateway.edits.length > 0);
+    expect(await count('tickets')).toBe(0); // §4.5: never a ticket request here
+    const [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810022'`);
+    expect(state.bot_state.flow).toBe('CHAT'); // mode persists
+  });
+
+  it('§4: exiting the chatbot restores the main menu and CLEARS the state; /cancel works too', async () => {
+    await register(810023);
+    clearSent();
+    await postUpdate(messageUpdate(810023, '/chatbot'));
+    await waitForSentFor(810023, 'دستیار هوشمند');
+    clearSent();
+
+    await postUpdate(messageUpdate(810023, '🔙 بازگشت به منوی اصلی'));
+    await waitForSentFor(810023, 'خارج شدید');
+    const menu = lastSent();
+    const kb = menu.reply_markup as { keyboard: { text: string }[][] };
+    expect(kb.keyboard.flat().map((b) => b.text)).toContain('🎫 ثبت تیکت جدید');
+    let [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810023'`);
+    expect(state.bot_state).toBeNull();
+    clearSent();
+
+    // /cancel also escapes the mode (§8 universal escape hatch)
+    await postUpdate(messageUpdate(810023, '/chatbot'));
+    await waitForSentFor(810023, 'دستیار هوشمند');
+    clearSent();
+    await postUpdate(messageUpdate(810023, '/cancel'));
+    await waitForSentFor(810023, 'لغو شد');
+    [state] = await ds.query(`SELECT bot_state FROM telegram_users WHERE telegram_id = '810023'`);
+    expect(state.bot_state).toBeNull();
+
+    // after exiting, plain texts NO LONGER land in the chatbot (§4.7)
+    clearSent();
+    await postUpdate(messageUpdate(810023, '🎫 ثبت تیکت جدید'));
+    await waitForSent('عنوان تیکت'); // the wizard starts instead
+    expect(await count('tickets')).toBe(0);
+  });
+
+  it('§5: two users chatting in parallel never mix their answers (per-chat isolation)', async () => {
+    await register(810024, 'کاربر الف تمیز');
+    await register(810025, 'کاربر دوم تمیز');
+
+    await postUpdate(messageUpdate(810024, 'سؤال اختصاصی کاربر الف'));
+    await postUpdate(messageUpdate(810025, 'سؤال اختصاصی کاربر ب'));
+
+    await waitFor(() => fakeGateway.edits.length >= 2);
+    const chatIds = fakeGateway.edits.map((e) => e.chat_id).sort();
+    expect(chatIds).toEqual(['810024', '810025']);
+    // each edit belongs to THAT user's own waiting message (waiting ids are
+    // identified by TEXT, immune to the registration sends around them)
+    const waitingIds = fakeGateway.sent
+      .map((s, i) => (s.text.includes('Chatbot is working') ? fakeGateway.sentIds[i] : null))
+      .filter(Boolean);
+    const editIds = fakeGateway.edits.map((e) => e.message_id).sort();
+    expect(editIds).toEqual([...waitingIds].sort());
   });
 
   it('scenario 14: a DB-level finalize failure keeps the wizard state and asks for a retry', async () => {
@@ -446,7 +587,9 @@ describe('ABRIT feature flows (profile → wizard → mytickets → AI chat)', (
 
     await postUpdate(messageUpdate(810016, '👤 پروفایل من'));
     await waitForSentFor(810016, 'پروفایل شما');
-    expect(findSent('پروفایل شما').text).toContain('کاربر آزمون');
+    const card = findSent('پروفایل شما');
+    expect(card.text).toContain('کاربر آزمون');
+    expect(card.text).toContain('شماره همراه');
     clearSent();
 
     await postUpdate(messageUpdate(810016, '🔍 پیگیری تیکت'));
@@ -456,10 +599,13 @@ describe('ABRIT feature flows (profile → wizard → mytickets → AI chat)', (
     await postUpdate(messageUpdate(810016, '❓ راهنما'));
     await waitForSent('راهنمای ربات');
     expect(lastSent().text).toContain('/mytickets');
+    expect(lastSent().text).toContain('/chatbot');
+    expect(fakeGateway.edits).toHaveLength(0); // /help NEVER touched OpenRouter
     clearSent();
 
     await postUpdate(messageUpdate(810016, 'دستور ناشناخته /whatever'));
-    // plain text (not a command) → general chat fallback
-    await waitForSent('پیام شما ثبت شد');
+    // plain text (not a command) → chatbot pipeline: waiting + degraded answer
+    await waitForSent('Chatbot is working on your request');
+    await waitFor(() => fakeGateway.edits.length > 0);
   });
 });

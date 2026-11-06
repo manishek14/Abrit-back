@@ -1,17 +1,17 @@
 import { FlowRouterService } from './flow-router.service';
 import { UsersService } from '../users/users.service';
-import { TicketsService } from '../tickets/tickets.service';
 import { MessagesService } from '../messages/messages.service';
 import { InboxService } from '../inbox/inbox.service';
-import { BotStateService } from './bot-state.service';
 import { RegistrationService } from './registration.service';
 import { TicketFlowService } from './ticket-flow.service';
 import { MyTicketsService } from './mytickets.service';
+import { ChatbotService } from './chatbot.service';
 import { CommandsService } from './commands.service';
-import { GeneralChatService } from '../ai/general-chat.service';
 import { ReplyProvider, REPLY_PROVIDER } from '../ai/reply-provider.interface';
 import { TelegramGateway } from '../telegram/telegram-gateway.interface';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
+import { REG_REQUIRED } from '../../common/bot-messages';
+import { BTN_CHATBOT_EXIT, BTN_COMPLETE_PROFILE, profileGateKeyboard } from '../telegram/keyboards';
 
 const mkUser = (over: Partial<TelegramUser> = {}): TelegramUser =>
   ({
@@ -28,18 +28,16 @@ const mkUser = (over: Partial<TelegramUser> = {}): TelegramUser =>
 const mkUpdate = (payload: Record<string, unknown>) =>
   ({ update_id: '9001', payload, status: 'RECEIVED' }) as never;
 
-describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
+describe('FlowRouterService (request §8 — THE routing precedence)', () => {
   let service: FlowRouterService;
-  let users: { upsertTelegramUser: jest.Mock; setBlocked: jest.Mock; setBotState: jest.Mock };
-  let tickets: { findActiveTicket: jest.Mock; findById: jest.Mock };
+  let users: { upsertTelegramUser: jest.Mock; setBlocked: jest.Mock };
   let messages: { findByTelegramUpdateId: jest.Mock; addOutboundMessage: jest.Mock; findAssistantReply: jest.Mock };
   let inbox: { markDone: jest.Mock };
-  let botState: { get: jest.Mock; withChatTurn: jest.Mock };
   let registration: { isComplete: jest.Mock; start: jest.Mock; handleText: jest.Mock; handleContact: jest.Mock };
   let ticketFlow: { handleText: jest.Mock; start: jest.Mock };
   let myTickets: { show: jest.Mock; handleCallback: jest.Mock; handleTicketReply: jest.Mock; handleViewAction: jest.Mock };
+  let chatbot: { handleText: jest.Mock; runTurn: jest.Mock; enter: jest.Mock };
   let commands: { handle: jest.Mock };
-  let generalChat: { reply: jest.Mock };
   let replyProvider: { reply: jest.Mock };
   let gateway: { active: boolean; sendMessage: jest.Mock; answerCallbackQuery: jest.Mock };
 
@@ -47,19 +45,13 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
     users = {
       upsertTelegramUser: jest.fn().mockImplementation(async () => mkUser()),
       setBlocked: jest.fn(),
-      setBotState: jest.fn(),
     };
-    tickets = { findActiveTicket: jest.fn().mockResolvedValue(null), findById: jest.fn() };
     messages = {
       findByTelegramUpdateId: jest.fn().mockResolvedValue(null),
       addOutboundMessage: jest.fn(),
       findAssistantReply: jest.fn().mockResolvedValue(null),
     };
     inbox = { markDone: jest.fn().mockResolvedValue(undefined) };
-    botState = {
-      get: jest.fn().mockResolvedValue(null),
-      withChatTurn: jest.fn().mockReturnValue({ flow: 'CHAT', data: { history: [] } }),
-    };
     registration = {
       isComplete: jest.fn(() => true),
       start: jest.fn().mockResolvedValue(undefined),
@@ -73,10 +65,12 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
       handleTicketReply: jest.fn().mockResolvedValue(null),
       handleViewAction: jest.fn().mockResolvedValue(false),
     };
-    commands = { handle: jest.fn().mockResolvedValue(undefined) };
-    generalChat = {
-      reply: jest.fn().mockResolvedValue({ content: 'پاسخ هوشمند', meta: { provider: 'openrouter' } }),
+    chatbot = {
+      handleText: jest.fn().mockResolvedValue(false),
+      runTurn: jest.fn().mockResolvedValue(undefined),
+      enter: jest.fn().mockResolvedValue(undefined),
     };
+    commands = { handle: jest.fn().mockResolvedValue(undefined) };
     replyProvider = { reply: jest.fn() };
     gateway = {
       active: true,
@@ -85,15 +79,13 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
     };
     service = new FlowRouterService(
       users as unknown as UsersService,
-      tickets as unknown as TicketsService,
       messages as unknown as MessagesService,
       inbox as unknown as InboxService,
-      botState as unknown as BotStateService,
       registration as unknown as RegistrationService,
       ticketFlow as unknown as TicketFlowService,
       myTickets as unknown as MyTicketsService,
+      chatbot as unknown as ChatbotService,
       commands as unknown as CommandsService,
-      generalChat as unknown as GeneralChatService,
       replyProvider as unknown as ReplyProvider,
       gateway as unknown as TelegramGateway,
     );
@@ -114,24 +106,35 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
     expect(inbox.markDone).toHaveBeenCalledWith('9001');
   });
 
+  it('callback from a GATED user → restriction + «تکمیل پروفایل» keyboard (§2, no auto-start)', async () => {
+    registration.isComplete.mockReturnValue(false);
+    await service.route(mkUpdate({ callback_query: { id: 'cb1', from: { id: 700100200 }, message: { chat: { id: 555, type: 'private' } }, data: 'myt:page:2' } }));
+    expect(myTickets.handleCallback).not.toHaveBeenCalled();
+    expect(gateway.answerCallbackQuery).toHaveBeenCalledWith('cb1');
+    // §2: restriction message + gate keyboard — registration does NOT auto-start
+    expect(gateway.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ text: REG_REQUIRED }));
+    expect(registration.start).not.toHaveBeenCalled();
+    expect(inbox.markDone).toHaveBeenCalledWith('9001');
+  });
+
   it('commands take precedence over flows (e.g. /cancel inside a wizard)', async () => {
     await service.route(textUpdate('/cancel'));
     expect(commands.handle).toHaveBeenCalledWith(expect.anything(), '555', { name: 'cancel', raw: '/cancel' });
-    expect(generalChat.reply).not.toHaveBeenCalled();
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
   });
 
   it('§4 HARD RULE: the wizard consumes the description — NEVER the AI handler', async () => {
     ticketFlow.handleText.mockResolvedValueOnce(true);
     await service.route(textUpdate('متن کامل درخواست تیکت من'));
     expect(ticketFlow.handleText).toHaveBeenCalledWith(expect.anything(), '555', 'متن کامل درخواست تیکت من', '9001');
-    expect(generalChat.reply).not.toHaveBeenCalled(); // the bug's exact regression test
+    expect(chatbot.runTurn).not.toHaveBeenCalled(); // the bug's exact regression test
   });
 
   it('§4 HARD RULE: registration consumes text while REGISTER_* is active', async () => {
     registration.handleText.mockResolvedValueOnce(true);
     await service.route(textUpdate('علی رضایی'));
     expect(registration.handleText).toHaveBeenCalled();
-    expect(generalChat.reply).not.toHaveBeenCalled();
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
   });
 
   it('§4 HARD RULE: TICKET_REPLY text goes into the ticket pipeline, not the AI chat', async () => {
@@ -145,13 +148,21 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
 
     expect(replyProvider.reply).toHaveBeenCalled();
     expect(messages.addOutboundMessage).toHaveBeenCalled(); // durable outbox
-    expect(generalChat.reply).not.toHaveBeenCalled();
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
+  });
+
+  it('§4/§7: chatbot mode consumes EVERY plain text — even menu-button labels go to the AI', async () => {
+    chatbot.handleText.mockResolvedValue(true);
+    await service.route(textUpdate('🎫 ثبت تیکت جدید'));
+    expect(chatbot.handleText).toHaveBeenCalledWith(expect.anything(), '555', '🎫 ثبت تیکت جدید', '9001');
+    expect(ticketFlow.start).not.toHaveBeenCalled(); // §4.5: never a ticket request in chat mode
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
   });
 
   it('menu buttons route to their actions (exact keyboard labels)', async () => {
     await service.route(textUpdate('🎫 ثبت تیکت جدید'));
     expect(ticketFlow.start).toHaveBeenCalled();
-    expect(generalChat.reply).not.toHaveBeenCalled();
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
 
     jest.clearAllMocks();
     users.upsertTelegramUser.mockResolvedValue(mkUser());
@@ -159,24 +170,56 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
     expect(myTickets.show).toHaveBeenCalledWith(expect.anything(), '555', 1);
   });
 
-  it('plain text from a REGISTERED user with no state → general AI chat (NOT a ticket)', async () => {
+  it('default plain text from a REGISTERED user with no state → chatbot runTurn (NOT a ticket)', async () => {
     await service.route(textUpdate('سلام، چطور تیکت ثبت کنم؟'));
-    expect(generalChat.reply).toHaveBeenCalledWith(expect.objectContaining({ userText: 'سلام، چطور تیکت ثبت کنم؟' }));
-    expect(gateway.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ text: 'پاسخ هوشمند' }));
-    expect(botState.withChatTurn).toHaveBeenCalled(); // history persists in bot_state
+    expect(chatbot.runTurn).toHaveBeenCalledWith(expect.anything(), '555', 'سلام، چطور تیکت ثبت کنم؟', '9001');
+    expect(ticketFlow.start).not.toHaveBeenCalled();
   });
 
-  it('plain text from an UNREGISTERED user → registration gate (§1)', async () => {
+  it('§2: a GATED user clicking a menu button gets the gate keyboard — the feature is NOT executed', async () => {
     registration.isComplete.mockReturnValue(false);
-    await service.route(textUpdate('سلام'));
-    expect(registration.start).toHaveBeenCalledWith(expect.anything(), '555', { gated: true });
-    expect(generalChat.reply).not.toHaveBeenCalled();
+    await service.route(textUpdate('🎫 ثبت تیکت جدید'));
+    expect(ticketFlow.start).not.toHaveBeenCalled();
+    expect(registration.start).not.toHaveBeenCalled(); // no auto-start — the user opts in
+    expect(gateway.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ text: REG_REQUIRED, reply_markup: profileGateKeyboard() }),
+    );
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
+  });
+
+  it('§2: a GATED user cannot bypass with random text either', async () => {
+    registration.isComplete.mockReturnValue(false);
+    await service.route(textUpdate('یه پیام معمولی'));
+    expect(gateway.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ reply_markup: profileGateKeyboard() }),
+    );
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
+  });
+
+  it('§2: BTN_COMPLETE_PROFILE from a gated user starts registration DIRECTLY (no restriction prefix)', async () => {
+    registration.isComplete.mockReturnValue(false);
+    await service.route(textUpdate(BTN_COMPLETE_PROFILE));
+    expect(registration.start).toHaveBeenCalledWith(expect.anything(), '555'); // no { gated: true }
+    expect(gateway.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('§2: BTN_EDIT_PROFILE from a registered user re-runs registration (edit path)', async () => {
+    await service.route(textUpdate('✏️ ویرایش اطلاعات'));
+    expect(registration.start).toHaveBeenCalledWith(expect.anything(), '555');
+  });
+
+  it('§4: the stale chatbot exit button with no state lands on the main menu', async () => {
+    await service.route(textUpdate(BTN_CHATBOT_EXIT));
+    expect(gateway.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ reply_markup: expect.anything() }),
+    );
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
   });
 
   it('dedup-first: an update whose message is already stored NEVER hits the AI chat', async () => {
     messages.findByTelegramUpdateId.mockResolvedValueOnce({ id: 'm-1', ticket_id: 't-1' });
     await service.route(textUpdate('متن تیکت قبلی'));
-    expect(generalChat.reply).not.toHaveBeenCalled();
+    expect(chatbot.runTurn).not.toHaveBeenCalled();
     expect(inbox.markDone).toHaveBeenCalled();
   });
 
@@ -209,10 +252,9 @@ describe('FlowRouterService (feature §4 — THE routing precedence)', () => {
     expect(inbox.markDone).toHaveBeenCalled();
   });
 
-  it('AI failure in general chat still markDone (the row never sticks PROCESSING for content reasons)', async () => {
-    generalChat.reply.mockRejectedValueOnce(new Error('boom'));
+  it('a thrown chatbot error propagates (row stays PROCESSING for the sweeper — never dropped)', async () => {
+    chatbot.runTurn.mockRejectedValueOnce(new Error('boom'));
     await expect(service.route(textUpdate('سلام'))).rejects.toThrow('boom');
-    // orchestrator catches → recordError; markDone NOT called (sweeper retry owns it)
     expect(inbox.markDone).not.toHaveBeenCalled();
   });
 

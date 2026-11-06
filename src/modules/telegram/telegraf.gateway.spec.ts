@@ -1,5 +1,5 @@
 import { Telegraf } from 'telegraf';
-import { TelegrafGateway } from './telegraf.gateway';
+import { TelegrafGateway, BOT_COMMANDS } from './telegraf.gateway';
 import { TelegramApiError } from './telegram-gateway.interface';
 import { DELIVERY_LEASE_MS } from '../messages/messages.service';
 import { parseEnv, type Env } from '../../config/env';
@@ -349,6 +349,141 @@ describe('TelegrafGateway (real long-polling launch)', () => {
     } finally {
       exitSpy.mockRestore();
     }
+  });
+
+  it('a successful bootstrap syncs the BotFather command list (request §7, /chatbot included)', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    const setMyCommands = jest.fn().mockResolvedValue(undefined);
+    stubApi(gateway);
+    (gateway as unknown as { bot: Telegraf }).bot.telegram.setMyCommands = setMyCommands;
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest.fn().mockResolvedValue(undefined);
+
+    await gateway.onApplicationBootstrap(60);
+    await new Promise((r) => setTimeout(r, 10)); // the sync is fire-and-forget
+
+    expect(setMyCommands).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ command: 'chatbot' }),
+        expect.objectContaining({ command: 'help' }),
+      ]),
+    );
+    expect(setMyCommands.mock.calls[0][0]).toHaveLength(BOT_COMMANDS.length);
+  });
+});
+
+/**
+ * Request-§4/§5 round — transport regressions:
+ *
+ * 1. callback_query forwarding: allowed_updates included callback_query, but
+ *    the gateway only ever registered bot.on('message') — Telegram DELIVERED
+ *    the button taps and the transport silently DROPPED them, so the
+ *    my-tickets inline pagination did nothing in production.
+ * 2. editMessageText: the chatbot's waiting message becomes the answer in
+ *    place (§5); the method must exist, work and propagate typed failures so
+ *    the caller can fall back to a fresh send.
+ */
+describe('TelegrafGateway (callback_query forwarding + editMessageText)', () => {
+  const mkLiveGateway = (): {
+    gateway: TelegrafGateway;
+    handler: jest.Mock;
+  } => {
+    const gateway = new TelegrafGateway(mkEnv());
+    const handler = jest.fn().mockResolvedValue(undefined);
+    gateway.setUpdateHandler(handler);
+    // no network: a minimal botInfo lets handleUpdate run the middleware chain
+    (gateway as unknown as { bot: Telegraf }).bot.botInfo = {
+      id: 9031915835,
+      is_bot: true,
+      first_name: 'ABRIT Support',
+      username: 'ABRIT_Ticket_Bot',
+      can_join_groups: false,
+      can_read_all_group_messages: false,
+      supports_inline_queries: false,
+    } as unknown as Awaited<ReturnType<Telegraf['telegram']['getMe']>>;
+    return { gateway, handler };
+  };
+
+  it('a callback_query update REACHES the ingest handler (was silently dropped before)', async () => {
+    const { gateway, handler } = mkLiveGateway();
+    const update = {
+      update_id: 551,
+      callback_query: {
+        id: 'cb-1',
+        from: { id: 700100200, is_bot: false },
+        message: { message_id: 10, chat: { id: 555, type: 'private' }, date: 1 },
+        data: 'myt:page:2',
+      },
+    };
+
+    await (gateway as unknown as { bot: Telegraf }).bot.handleUpdate(update as never);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(update);
+  });
+
+  it('a message update still reaches the ingest handler (both shapes co-exist)', async () => {
+    const { gateway, handler } = mkLiveGateway();
+    const update = {
+      update_id: 552,
+      message: {
+        message_id: 11,
+        from: { id: 700100200, is_bot: false },
+        chat: { id: 555, type: 'private' },
+        date: 1,
+        text: 'سلام',
+      },
+    };
+
+    await (gateway as unknown as { bot: Telegraf }).bot.handleUpdate(update as never);
+
+    expect(handler).toHaveBeenCalledWith(update);
+  });
+
+  it('a handler rejection inside the callback path never becomes an unhandled rejection', async () => {
+    const { gateway, handler } = mkLiveGateway();
+    handler.mockRejectedValueOnce(new Error('pipeline exploded'));
+    const update = {
+      update_id: 553,
+      callback_query: {
+        id: 'cb-2',
+        from: { id: 700100200, is_bot: false },
+        message: { message_id: 12, chat: { id: 555, type: 'private' }, date: 1 },
+        data: 'myt:noop',
+      },
+    };
+
+    await expect(
+      (gateway as unknown as { bot: Telegraf }).bot.handleUpdate(update as never),
+    ).resolves.toBeUndefined();
+    await new Promise((r) => setTimeout(r, 20)); // the async catch must absorb it
+  });
+
+  it('editMessageText replaces a message in place', async () => {
+    const gateway = new TelegrafGateway(mkEnv());
+    const edit = jest.fn().mockResolvedValue(true);
+    (gateway as unknown as { bot: Telegraf }).bot.telegram = {
+      editMessageText: edit,
+    } as unknown as Telegraf['telegram'];
+
+    await gateway.editMessageText({ chat_id: '555', message_id: '42', text: 'پاسخ' });
+
+    expect(edit).toHaveBeenCalledWith('555', 42, undefined, 'پاسخ');
+  });
+
+  it('editMessageText failures propagate as typed TelegramApiError (caller falls back to sends)', async () => {
+    const gateway = new TelegrafGateway(mkEnv());
+    (gateway as unknown as { bot: Telegraf }).bot.telegram = {
+      editMessageText: jest.fn().mockRejectedValue(
+        Object.assign(new Error('Bad Request: message to edit not found'), {
+          response: { error_code: 400, description: 'Bad Request: message to edit not found' },
+        }),
+      ),
+    } as unknown as Telegraf['telegram'];
+
+    await expect(
+      gateway.editMessageText({ chat_id: '555', message_id: '42', text: 'پاسخ' }),
+    ).rejects.toBeInstanceOf(TelegramApiError);
   });
 });
 

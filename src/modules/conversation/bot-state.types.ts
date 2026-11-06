@@ -39,6 +39,14 @@ export interface BotStateData {
   ticketId?: string;
   /** general-chat history (compact entries) */
   history?: ChatHistoryEntry[];
+  /**
+   * Chatbot dedup marker (request §5: «از ارسال درخواست تکراری به OpenRouter
+   * برای یک Update جلوگیری کن»): the update currently being (or already)
+   * answered. A sweeper re-drive of the SAME update sees its own marker and
+   * skips the second provider call — at-most-once per update, chosen
+   * deliberately over at-least-once for paid AI calls.
+   */
+  last_update_id?: string;
 }
 
 export type StateInput = BotStateData;

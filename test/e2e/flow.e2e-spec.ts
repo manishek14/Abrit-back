@@ -7,7 +7,6 @@ import { OutboxDispatcherService } from '../../src/modules/telegram/outbox-dispa
 import { MessagesService } from '../../src/modules/messages/messages.service';
 import { TelegramApiError } from '../../src/modules/telegram/telegram-gateway.interface';
 import { InboxRetentionService } from '../../src/modules/inbox/inbox-retention.service';
-import { AI_FALLBACK_MESSAGE } from '../../src/common/ticket-labels';
 import { FakeTelegramGateway } from '../fakes/telegram-gateway.fake';
 import { createTestApp } from '../testing/app-builder';
 
@@ -170,16 +169,19 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect(Number(inbox[0].attempts)).toBe(1);
   });
 
-  it('scenario 2/4: a REGISTERED user\'s plain text goes to the AI chat (NO auto-ticket); the wizard is the ONLY ticket path', async () => {
+  it('scenario 2/4: a REGISTERED user\'s plain text goes to the chatbot pipeline (waiting → edit), NO auto-ticket; the wizard is the ONLY ticket path', async () => {
     await register(910002);
     fakeGateway.sent = [];
     await postUpdate(messageUpdate(910002, 'درگاه پرداخت خطا می‌دهد'));
 
-    // the AI key is intentionally empty in e2e → the honest fallback, ephemerally
+    // §5: the waiting message first; the AI key is intentionally empty in e2e
+    // → the honest degraded answer EDITS the waiting message in place
     await botSent(1);
-    const reply = fakeGateway.sent[0];
-    expect(reply.text).toContain('پیام شما ثبت شد'); // honest fallback (AI key empty)
-    expect(reply.chat_id).toBe('910002');
+    const waiting = fakeGateway.sent[0];
+    expect(waiting.text).toBe('Chatbot is working on your request. Please wait a moment.');
+    expect(waiting.chat_id).toBe('910002');
+    await waitFor(() => fakeGateway.edits.length > 0);
+    expect(fakeGateway.edits[0].text).toContain('خطایی رخ داد'); // understandable, retryable
 
     // NO ticket, NO messages row — general conversations are not tickets
     expect(await count('tickets')).toBe(0);
@@ -292,7 +294,7 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     expect(JSON.stringify(msgsB)).not.toContain('کاربر الف');
   });
 
-  it('scenario 14: AI disabled from the panel → the general chat answers the fixed fallback (no provider call)', async () => {
+  it('scenario 14: AI disabled from the panel → the chatbot answers the understandable §5 error (no provider call)', async () => {
     await register(910004);
     fakeGateway.sent = [];
     await authed(
@@ -300,11 +302,15 @@ describe('AbrIT e2e flows (plan §11 scenarios)', () => {
     ).expect(200);
 
     await postUpdate(messageUpdate(910004, 'سلام'));
-    await botSent(1);
+    await botSent(1); // exactly one send: the §5 waiting message
 
-    const reply = fakeGateway.sent.at(-1)!;
-    // the exact honest fallback for a disabled assistant, sent ephemerally:
-    expect(reply.text).toBe(AI_FALLBACK_MESSAGE);
+    const waiting = fakeGateway.sent.at(-1)!;
+    expect(waiting.text).toBe('Chatbot is working on your request. Please wait a moment.');
+    await waitFor(() => fakeGateway.edits.length > 0);
+    // the disabled assistant degrades to the §5 error — understandable + retryable,
+    // never the ticket-style «پیام شما ثبت شد» (a chat stores nothing)
+    expect(fakeGateway.edits.at(-1)!.text).toContain('خطایی رخ داد');
+    expect(fakeGateway.edits.at(-1)!.message_id).toBe(fakeGateway.sentIds.at(-1));
     expect(await count('messages')).toBe(0); // nothing stored — no provider call happened
 
     // restore for the remaining tests

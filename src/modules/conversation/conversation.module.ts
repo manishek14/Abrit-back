@@ -6,6 +6,7 @@ import { UsersModule } from '../users/users.module';
 import { AiModule } from '../ai/ai.module';
 import { TelegramCoreModule } from '../telegram/telegram-core.module';
 import { BotStateService } from './bot-state.service';
+import { ChatbotService } from './chatbot.service';
 import { CommandsService } from './commands.service';
 import { FlowRouterService } from './flow-router.service';
 import { MyTicketsService } from './mytickets.service';
@@ -20,6 +21,7 @@ import { TicketFlowService } from './ticket-flow.service';
     RegistrationService,
     TicketFlowService,
     MyTicketsService,
+    ChatbotService,
     CommandsService,
     FlowRouterService,
     OrchestratorService,

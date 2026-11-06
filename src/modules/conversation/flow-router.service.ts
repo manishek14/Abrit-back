@@ -3,45 +3,55 @@ import { BotUpdate } from '../../database/entities/bot-update.entity';
 import { TelegramUser } from '../../database/entities/telegram-user.entity';
 import { MessageRole } from '../../database/enums';
 import { UsersService } from '../users/users.service';
-import { TicketsService } from '../tickets/tickets.service';
 import { MessagesService } from '../messages/messages.service';
 import { InboxService } from '../inbox/inbox.service';
-import { BotStateService, } from './bot-state.service';
-import { ChatHistoryEntry } from './bot-state.types';
+import { ONLY_TEXT_SUPPORTED_MESSAGE } from '../../common/ticket-labels';
 import { RegistrationService } from './registration.service';
 import { TicketFlowService } from './ticket-flow.service';
 import { MyTicketsService, StoredTicketReply } from './mytickets.service';
+import { ChatbotService } from './chatbot.service';
 import { CommandsService, parseCommand } from './commands.service';
 import { sendEphemeral, TELEGRAM_GATEWAY, TelegramGateway } from '../telegram/telegram-gateway.interface';
 import {
+  BTN_CHATBOT_EXIT,
+  BTN_COMPLETE_PROFILE,
+  BTN_EDIT_PROFILE,
   BTN_HELP,
   BTN_MY_TICKETS,
   BTN_NEW_TICKET,
   BTN_PROFILE,
   BTN_TRACK,
+  mainMenuKeyboard,
+  profileGateKeyboard,
 } from '../telegram/keyboards';
-import { GeneralChatService } from '../ai/general-chat.service';
 import { ReplyProvider, REPLY_PROVIDER } from '../ai/reply-provider.interface';
-import { buildAbritContextBlock } from '../ai/abrit-persona';
-import { TICKET_STATUS_LABELS, ONLY_TEXT_SUPPORTED_MESSAGE } from '../../common/ticket-labels';
+import { REG_REQUIRED } from '../../common/bot-messages';
 
 /**
- * THE router (feature round §4 — the root-cause fix): every claimed update is
- * dispatched to EXACTLY ONE handler with this strict precedence —
+ * THE router: every claimed update is dispatched to EXACTLY ONE handler with
+ * this strict precedence (request §8) —
  *
- *   callback_query → my-tickets callbacks
- *   contact        → registration (phone step)
- *   /command       → commands
- *   state flow     → the flow that owns the state (registration / wizard /
- *                    ticket view / ticket reply) — §4's hard rule: while the
- *                    wizard asks for the description, the text is consumed by
- *                    the wizard and NEVER reaches the general/AI handler
- *   menu button    → the matching main-menu action
- *   plain text     → OpenRouter general conversation (profile required)
+ *   1. callback_query          → my-tickets callbacks
+ *   2. contact                 → registration (phone step)
+ *   3. /commands               → commands (each one gates itself; /profile,
+ *                                /help, /cancel, /chatbot stay reachable)
+ *   4. registration state      → REGISTER_* texts (owned exclusively)
+ *   5. ticket flow state       → TICKET_* texts + view/reply actions
+ *                                (§4's hard rule: the wizard's description
+ *                                NEVER reaches the AI/general handler)
+ *   6. chatbot state           → CHAT mode texts (exit button or AI turn —
+ *                                in chat mode plain texts are never menu
+ *                                actions or ticket requests, §4/§7)
+ *   7. profile gate            → protected-feature texts from a gated user
+ *                                get the restriction + «تکمیل پروفایل»
+ *                                keyboard; the button itself starts the flow
+ *   8. main-menu buttons       → the matching action
+ *   9. default plain text      → chatbot runTurn (waiting → OpenRouter →
+ *                                edit-or-send) — never a ticket (§6)
  *
  * This replaces the old «every text = new ticket + AI reply» behaviour, which
- * was the bug: a user mid-flow saw the generic greeting instead of their
- * flow's next step because no state existed at all.
+ * was the original bug: a user mid-flow saw the generic greeting instead of
+ * their flow's next step because no state existed at all.
  */
 @Injectable()
 export class FlowRouterService {
@@ -49,15 +59,13 @@ export class FlowRouterService {
 
   constructor(
     private readonly usersService: UsersService,
-    private readonly ticketsService: TicketsService,
     private readonly messagesService: MessagesService,
     private readonly inboxService: InboxService,
-    private readonly botState: BotStateService,
     private readonly registration: RegistrationService,
     private readonly ticketFlow: TicketFlowService,
     private readonly myTickets: MyTicketsService,
+    private readonly chatbot: ChatbotService,
     private readonly commandsService: CommandsService,
-    private readonly generalChat: GeneralChatService,
     @Inject(REPLY_PROVIDER) private readonly replyProvider: ReplyProvider,
     @Inject(TELEGRAM_GATEWAY) private readonly gateway: TelegramGateway,
   ) {}
@@ -105,8 +113,12 @@ export class FlowRouterService {
     }
 
     if (!this.registration.isComplete(user)) {
+      // §2: an inline button is a protected feature — restriction + the
+      // «تکمیل پروفایل»-only keyboard (never an auto-started registration).
       await this.gateway.answerCallbackQuery?.(cb.id);
-      await this.registration.start(user, chatId, { gated: true });
+      await sendEphemeral(this.gateway, chatId, REG_REQUIRED, this.logger, {
+        reply_markup: profileGateKeyboard(),
+      });
       await this.inboxService.markDone(updateId);
       return;
     }
@@ -136,74 +148,106 @@ export class FlowRouterService {
       return;
     }
 
-      // §1: the contact button only means something in the phone step
-      if (msg.contact) {
-        await this.registration.handleContact(user, chatId, msg.contact);
-        await this.inboxService.markDone(updateId);
-        return;
-      }
+    // (2) the contact button only means something in the phone step
+    if (msg.contact) {
+      await this.registration.handleContact(user, chatId, msg.contact);
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-      const text = (msg.text ?? '').trim();
+    const text = (msg.text ?? '').trim();
 
-      // commands first — they must work in ANY state (/start, /cancel…)
-      const command = parseCommand(text);
-      if (command) {
-        await this.commandsService.handle(user, chatId, command);
-        await this.inboxService.markDone(updateId);
-        return;
-      }
+    // (3) commands first — they must work in ANY state (/start, /cancel…)
+    const command = parseCommand(text);
+    if (command) {
+      await this.commandsService.handle(user, chatId, command);
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-      if (!text) {
-        await sendEphemeral(this.gateway, chatId, ONLY_TEXT_SUPPORTED_MESSAGE, this.logger);
-        await this.inboxService.markDone(updateId);
-        return;
-      }
+    if (!text) {
+      await sendEphemeral(this.gateway, chatId, ONLY_TEXT_SUPPORTED_MESSAGE, this.logger);
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-      // §4 THE HARD RULE: a state owner consumes the text exclusively.
-      if (await this.registration.handleText(user, chatId, text)) {
-        await this.inboxService.markDone(updateId);
-        return;
-      }
-      if (await this.ticketFlow.handleText(user, chatId, text, updateId)) {
-        await this.inboxService.markDone(updateId);
-        return;
-      }
-      const ticketReply = await this.myTickets.handleTicketReply(user, chatId, text, updateId);
-      if (ticketReply) {
-        await this.runTicketReplyPipeline(ticketReply);
-        await this.inboxService.markDone(updateId);
-        return;
-      }
-      if (await this.myTickets.handleViewAction(user, chatId, text)) {
-        await this.inboxService.markDone(updateId);
-        return;
-      }
+    // (4)(5) §4 THE HARD RULE: a state owner consumes the text exclusively.
+    if (await this.registration.handleText(user, chatId, text)) {
+      await this.inboxService.markDone(updateId);
+      return;
+    }
+    if (await this.ticketFlow.handleText(user, chatId, text, updateId)) {
+      await this.inboxService.markDone(updateId);
+      return;
+    }
+    const ticketReply = await this.myTickets.handleTicketReply(user, chatId, text, updateId);
+    if (ticketReply) {
+      await this.runTicketReplyPipeline(ticketReply);
+      await this.inboxService.markDone(updateId);
+      return;
+    }
+    if (await this.myTickets.handleViewAction(user, chatId, text)) {
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-      // profile gate (§1/§8): main features stay locked until registration
-      if (!this.registration.isComplete(user)) {
-        await this.registration.start(user, chatId, { gated: true });
-        await this.inboxService.markDone(updateId);
-        return;
-      }
+    // (6) chatbot mode owns EVERY plain text while active (§4: never a menu
+    // action / ticket request in chat mode; only real commands escape)
+    if (await this.chatbot.handleText(user, chatId, text, updateId)) {
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-      // DEDUP-FIRST (inherited from the old orchestrator): a re-run of an
-      // update whose text was already stored (wizard finalize completed but
-      // crashed before markDone) must NEVER fall through to general chat —
-      // the work is done, the outbox owns the rest.
-      const alreadyStored = await this.messagesService.findByTelegramUpdateId(updateId);
-      if (alreadyStored) {
-        await this.inboxService.markDone(updateId);
-        return;
+    // (7) profile gate (§2): protected-feature texts from a gated user get
+    // the restriction + the «تکمیل پروفایل»-only keyboard; the button starts
+    // the flow directly. Server-side, so no keyboard trick bypasses it.
+    if (!this.registration.isComplete(user)) {
+      // /profile and /help are NOT protected features (§1/§2) — the matching
+      // menu buttons stay reachable for a gated user too.
+      if (text === BTN_PROFILE || text === BTN_HELP) {
+        await this.commandsService.handle(user, chatId, {
+          name: text === BTN_HELP ? 'help' : 'profile',
+          raw: text,
+        });
+      } else if (text === BTN_COMPLETE_PROFILE) {
+        // §2: the gate keyboard's button enters the profile flow DIRECTLY —
+        // no second restriction message in front of it.
+        await this.registration.start(user, chatId);
+      } else {
+        await sendEphemeral(this.gateway, chatId, REG_REQUIRED, this.logger, {
+          reply_markup: profileGateKeyboard(),
+        });
       }
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-      // main-menu reply-keyboard buttons (exact factory constants — §5)
-      if (await this.handleMenuButton(user, chatId, text)) {
-        await this.inboxService.markDone(updateId);
-        return;
-      }
+    // the edit entry on the profile card re-runs registration (§2: /profile
+    // stays usable for editing previous info)
+    if (text === BTN_EDIT_PROFILE) {
+      await this.registration.start(user, chatId);
+      await this.inboxService.markDone(updateId);
+      return;
+    }
 
-    // default: OpenRouter general conversation (never a ticket — §6)
-    await this.handleGeneralChat(user, chatId, text);
+    // DEDUP-FIRST (inherited from the old orchestrator): a re-run of an
+    // update whose text was already stored (wizard finalize completed but
+    // crashed before markDone) must NEVER fall through to general chat —
+    // the work is done, the outbox owns the rest.
+    const alreadyStored = await this.messagesService.findByTelegramUpdateId(updateId);
+    if (alreadyStored) {
+      await this.inboxService.markDone(updateId);
+      return;
+    }
+
+    // (8) main-menu reply-keyboard buttons (exact factory constants — §5)
+    if (await this.handleMenuButton(user, chatId, text)) {
+      await this.inboxService.markDone(updateId);
+      return;
+    }
+
+    // (9) default: OpenRouter general conversation (never a ticket — §6)
+    await this.chatbot.runTurn(user, chatId, text, updateId);
     await this.inboxService.markDone(updateId);
     // NO try/catch: a thrown error propagates to the orchestrator so the row
     // stays PROCESSING and the sweeper retries it — markDone above only ever
@@ -250,39 +294,15 @@ export class FlowRouterService {
       case BTN_HELP:
         await this.commandsService.handle(user, chatId, { name: 'help', raw: '/help' });
         return true;
+      case BTN_CHATBOT_EXIT:
+        // stale chatbot keyboard with a cleared state — return to the menu
+        await sendEphemeral(this.gateway, chatId, 'منوی اصلی ربات:', this.logger, {
+          reply_markup: mainMenuKeyboard(),
+        });
+        return true;
       default:
         return false;
     }
-  }
-
-  /** General OpenRouter conversation — ephemeral, history kept in bot_state. */
-  private async handleGeneralChat(
-    user: TelegramUser,
-    chatId: string,
-    text: string,
-  ): Promise<void> {
-    const state = await this.botState.get(user);
-    const history: ChatHistoryEntry[] =
-      state?.flow === 'CHAT' ? (state.data?.history as ChatHistoryEntry[] | undefined) ?? [] : [];
-
-    const activeTicket = await this.ticketsService.findActiveTicket(user.id);
-    const contextBlock = buildAbritContextBlock({
-      fullName: user.full_name,
-      activeTicket: activeTicket
-        ? `${activeTicket.ticket_number} (${TICKET_STATUS_LABELS[activeTicket.status]})`
-        : null,
-    });
-
-    const result = await this.generalChat.reply({ history, contextBlock, userText: text });
-
-    // history persists ONLY on a real AI answer — a fallback must not poison
-    // the next turn with an unanswered question
-    if (result.meta.provider === 'openrouter') {
-      const next = this.botState.withChatTurn(state, text, result.content);
-      await this.usersService.setBotState(user.id, next as TelegramUser['bot_state']);
-    }
-
-    await sendEphemeral(this.gateway, chatId, result.content, this.logger);
   }
 
   /** The durable in-ticket reply pipeline (stored → AI → outbox), with the

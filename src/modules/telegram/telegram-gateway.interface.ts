@@ -28,6 +28,17 @@ export interface TelegramGateway {
    * failures are logged and never thrown.
    */
   answerCallbackQuery?(callbackQueryId: string, text?: string): Promise<void>;
+  /**
+   * Replaces a previously sent message's text (request §5: the chatbot's
+   * «working on it» placeholder becomes the final answer in place). Real
+   * transports implement it; when absent or failing the caller falls back to
+   * a fresh sendMessage — degrades UX, never correctness.
+   */
+  editMessageText?(params: {
+    chat_id: string;
+    message_id: string;
+    text: string;
+  }): Promise<void>;
 }
 
 export const TELEGRAM_GATEWAY = Symbol('TELEGRAM_GATEWAY');

@@ -61,6 +61,19 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
         );
       }
     });
+
+    // INLINE BUTTONS (request-§4 round + my-tickets pagination): without this
+    // handler callback_query updates were silently DROPPED by the transport —
+    // Telegram delivered them (allowed_updates) but nothing ever reached the
+    // ingest pipeline, so the rendered buttons did nothing when tapped.
+    this.bot.on('callback_query', (ctx) => {
+      const update = ctx.update as unknown as RawTelegramUpdate;
+      if (this.updateHandler) {
+        void this.updateHandler(update).catch((e) =>
+          this.logger.error(`callback handler failed: ${(e as Error).message}`),
+        );
+      }
+    });
   }
 
   setUpdateHandler(handler: (update: RawTelegramUpdate) => Promise<void>): void {
@@ -97,6 +110,19 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
         );
         this.logger.log('Polling started (allowed_updates: ' + this.allowedUpdates.join(',') + ')');
       }
+      // BotFather command list (request §7): /chatbot joins the menu so the
+      // separation from /help is visible in the client's command UI too.
+      // Strictly informational — the async IIFE catches BOTH sync (missing
+      // API member) and async (network/API) failures, so this can never
+      // degrade the bootstrap.
+      void (async () => {
+        try {
+          await this.bot.telegram.setMyCommands(BOT_COMMANDS as never);
+          this.logger.log('BotFather command list synced');
+        } catch (e) {
+          this.logger.warn(`setMyCommands failed (informational): ${(e as Error).message}`);
+        }
+      })();
       this.integrationState?.setTelegram('ok');
     } catch (e) {
       const message = (e as Error).message;
@@ -166,6 +192,29 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
       await this.bot.telegram.answerCbQuery(callbackQueryId, text || undefined);
     } catch (e) {
       this.logger.warn(`answerCallbackQuery failed (informational): ${(e as Error).message}`);
+    }
+  }
+
+  /** In-place text replacement (chatbot waiting → answer, request §5). Unlike
+   *  answerCallbackQuery this REJECTS on failure — the caller owns the
+   *  fallback (send a fresh message) and needs to know the edit did not land. */
+  async editMessageText(params: {
+    chat_id: string;
+    message_id: string;
+    text: string;
+  }): Promise<void> {
+    try {
+      await this.withSendTimeout(
+        this.bot.telegram.editMessageText(
+          params.chat_id as never,
+          Number(params.message_id) as never,
+          undefined,
+          params.text,
+        ),
+      );
+    } catch (e) {
+      if (e instanceof TelegramApiError) throw e;
+      throw this.mapError(e);
     }
   }
 
@@ -242,4 +291,18 @@ const PERMANENT_400_PATTERNS = [
   /message text is empty/i,
   /message is too long/i,
   /message thread not found/i,
+];
+
+/** The BotFather command list (request §7) — synced on every boot; Persian
+ *  descriptions exactly match /help's wording. /help stays the ONLY help
+ *  surface and never routes to the AI; /chatbot is the only AI entry. */
+export const BOT_COMMANDS: { command: string; description: string }[] = [
+  { command: 'new', description: 'ثبت تیکت جدید' },
+  { command: 'mytickets', description: 'تیکت‌های من' },
+  { command: 'profile', description: 'پروفایل من' },
+  { command: 'status', description: 'پیگیری تیکت' },
+  { command: 'close', description: 'بستن تیکت فعال' },
+  { command: 'cancel', description: 'لغو فرایند جاری' },
+  { command: 'chatbot', description: 'گفت‌وگو با دستیار هوشمند' },
+  { command: 'help', description: 'راهنمای دستورات' },
 ];
