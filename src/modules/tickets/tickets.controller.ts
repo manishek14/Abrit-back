@@ -15,13 +15,19 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { IsInt, IsNotEmpty, IsOptional, IsString, Matches, Max, MaxLength, Min, Validate } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
-import type { Response } from 'express';
 import { TicketsService } from './tickets.service';
 import { MessagesService, MAX_PAGE_SIZE } from '../messages/messages.service';
 import { ListTicketsQueryDto } from './dto/list-tickets-query.dto';
 import { UpdateTicketStatusDto } from './dto/update-ticket-status.dto';
 import { CurrentAdmin, CurrentAdminPayload } from '../../common/decorators/current-admin.decorator';
 import { IsMessageIdCursorConstraint } from '../../common/validators/message-id-cursor.validator';
+
+/**
+ * Minimal structural type for Nest's passthrough @Res() object — avoids a
+ * hard dependency on @types/express while keeping `res.status(...)` typed.
+ * (The lockfile stays exactly the CI-verified one; see commit history.)
+ */
+type PassthroughResponse = { status(code: number): unknown };
 
 /**
  * Conversation history, ordered and cursor-paginated:
@@ -155,7 +161,7 @@ export class TicketsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateTicketMessageDto,
     @CurrentAdmin() admin: CurrentAdminPayload,
-    @Res({ passthrough: true }) res: Response,
+    @Res({ passthrough: true }) res: PassthroughResponse,
   ) {
     const { message, replayed } = await this.messagesService.addAdminMessage({
       ticket_id: id,
