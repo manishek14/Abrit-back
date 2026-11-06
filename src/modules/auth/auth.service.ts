@@ -39,4 +39,11 @@ export class AuthService {
     });
     return { accessToken, admin: { id: admin.id, email: admin.email, name: admin.name } };
   }
+
+  /** Session restore (GET /auth/me): the JWT sub must still be a real admin. */
+  async me(adminId: string): Promise<AdminPublic> {
+    const admin = await this.admins.findOne({ where: { id: adminId } });
+    if (!admin) throw new UnauthorizedException('Admin no longer exists');
+    return { id: admin.id, email: admin.email, name: admin.name };
+  }
 }

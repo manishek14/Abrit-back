@@ -96,6 +96,11 @@ export const RawEnvSchema = z
       .string()
       .min(1, 'required, e.g. postgres://abrit:abrit@127.0.0.1:5432/abrit')
       .refine((v) => /^postgres(ql)?:\/\//.test(v), 'must start with postgres:// — this project uses PostgreSQL'),
+    // Review round 6 (production DB): TLS for managed PostgreSQL services.
+    // DATABASE_SSL=true enables TLS; DATABASE_SSL_CA (PEM body) additionally
+    // pins the server certificate; `?sslmode=require` in the URL also works.
+    DATABASE_SSL: boolString.optional(),
+    DATABASE_SSL_CA: z.string().optional(),
     MIGRATIONS_RUN: boolString.default('true'),
     // development convenience only — see the production rule in superRefine
     SEED_DEMO_DATA: boolString.optional(),
@@ -107,7 +112,16 @@ export const RawEnvSchema = z
     JWT_SECRET: z
       .string()
       .min(1, 'required and must be a real secret (no default on purpose) — length is validated after trimming'),
-    JWT_EXPIRES_IN: z.string().default('8h'),
+    // jsonwebtoken format: bare digits = ms, or s/m/h/d units — also mirrors
+    // the session cookie maxAge (review round 6: expiry policy is ONE value).
+    JWT_EXPIRES_IN: z
+      .string()
+      .regex(/^\d+([smhd])?$/, 'must look like "45m", "8h", "7d" (bare digits = ms)')
+      .default('8h'),
+    // Review round 6 (session security): the panel session lives in an
+    // HttpOnly cookie. Secure defaults to ON in production (HTTPS mandatory
+    // there) and can be forced either way for exotic proxies.
+    COOKIE_SECURE: boolString.optional(),
     ADMIN_EMAIL: z.string().email().default('admin@abrit.local'),
     ADMIN_PASSWORD: z.string()
       .min(8, 'at least 8 characters')

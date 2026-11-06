@@ -14,7 +14,9 @@ async function bootstrap(): Promise<void> {
   app.use(helmet());
   app.enableCors({
     origin: env.CORS_ORIGIN.split(',').map((o) => o.trim()),
-    credentials: false,
+    // round 6: the panel authenticates with the HttpOnly session cookie, so
+    // cross-origin dev requests must be allowed to carry credentials.
+    credentials: true,
   });
   app.useGlobalPipes(
     new ValidationPipe({
@@ -38,4 +40,10 @@ async function bootstrap(): Promise<void> {
   Logger.log(`AbrIT API listening on http://localhost:${env.PORT}/api (docs: /api/docs)`, 'Bootstrap');
 }
 
-void bootstrap();
+// Round 6 fix #1: a failed bootstrap (bad Telegram token in production, DB
+// unreachable, config error) must EXIT the process — a supervisor/container
+// restarts it, and health tooling never sees a half-alive service.
+bootstrap().catch((e: unknown) => {
+  Logger.error(`Fatal bootstrap error: ${(e as Error)?.message ?? e}`, 'Bootstrap');
+  process.exit(1);
+});

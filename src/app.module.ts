@@ -8,7 +8,9 @@ import { parseEnv } from './config/env';
 import { buildTypeOrmOptions } from './config/typeorm.config';
 import { DatabaseInitService } from './database/database-init.service';
 import { EventsModule } from './common/events/events.module';
+import { IntegrationStateModule } from './common/integration-state/integration-state.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
+import { CsrfGuard } from './common/guards/csrf.guard';
 import { HealthModule } from './modules/health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
@@ -37,6 +39,7 @@ import { WsModule } from './modules/ws/ws.module';
     ScheduleModule.forRoot(),
     // mild global rate limit (per IP); login has a much stricter @Throttle
     ThrottlerModule.forRoot({ throttlers: [{ name: 'default', ttl: 60_000, limit: 300 }] }),
+    IntegrationStateModule,
     EventsModule,
     AuthModule,
     UsersModule,
@@ -55,6 +58,9 @@ import { WsModule } from './modules/ws/ws.module';
     DatabaseInitService,
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // AFTER the JWT guard (registration order): hardens cookie-authenticated
+    // state-changing requests with the double-submit token (review round 6).
+    { provide: APP_GUARD, useClass: CsrfGuard },
   ],
 })
 export class AppModule {}

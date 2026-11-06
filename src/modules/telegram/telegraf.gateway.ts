@@ -1,8 +1,12 @@
 import { Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { Telegraf } from 'telegraf';
 import { Env } from '../../config/env';
+import { IntegrationStateService } from '../../common/integration-state/integration-state.service';
 import { RawTelegramUpdate } from './types';
 import { TelegramApiError, TelegramGateway } from './telegram-gateway.interface';
+
+/** The getMe() probe is bounded — a black-holed network must not stall the boot. */
+const BOOTSTRAP_PROBE_TIMEOUT_MS = 15_000;
 
 /**
  * Real Telegram transport built on Telegraf. Created ONLY when TELEGRAM_BOT_TOKEN
@@ -16,6 +20,13 @@ import { TelegramApiError, TelegramGateway } from './telegram-gateway.interface'
  * with backoff) instead of outliving its lease, which previously let the
  * sweeper re-claim the message and double-send it while worker 1 was still
  * in flight.
+ *
+ * Bootstrap degradation (review round 6 fix #1): a failed launch used to be
+ * logged and forgotten — the app looked healthy while the bot was dead. Now
+ * the gateway first proves the token + reachability with a bounded getMe()
+ * probe, reports the lifecycle (starting/ok/degraded) into the shared
+ * IntegrationStateService (surfaced by the readiness probe), and in PRODUCTION
+ * rethrows so the process refuses to serve a dead bot.
  */
 export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap, OnModuleDestroy {
   readonly active = true;
@@ -24,7 +35,10 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
   private readonly allowedUpdates: string[];
   private updateHandler?: (update: RawTelegramUpdate) => Promise<void>;
 
-  constructor(private readonly env: Env) {
+  constructor(
+    private readonly env: Env,
+    private readonly integrationState?: IntegrationStateService,
+  ) {
     this.bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
     this.allowedUpdates = env.TELEGRAM_ALLOWED_UPDATES.split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -42,8 +56,17 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
     this.updateHandler = handler;
   }
 
-  async onApplicationBootstrap(): Promise<void> {
+  async onApplicationBootstrap(probeTimeoutMs = BOOTSTRAP_PROBE_TIMEOUT_MS): Promise<void> {
+    this.integrationState?.setTelegram('starting');
     try {
+      // Prove the token and reachability FIRST — getMe is the cheapest call
+      // that fails for exactly the reasons a boot can fail (bad token, no
+      // network). Bounded so a black-holed network cannot hang the boot.
+      await this.withBootstrapTimeout(
+        this.bot.telegram.getMe() as Promise<unknown>,
+        probeTimeoutMs,
+      );
+
       if (this.env.TELEGRAM_MODE === 'webhook') {
         await this.bot.telegram.setWebhook(this.env.TELEGRAM_WEBHOOK_URL, {
           secret_token: this.env.TELEGRAM_WEBHOOK_SECRET,
@@ -56,9 +79,19 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
         await this.bot.launch({ allowedUpdates: this.allowedUpdates as never });
         this.logger.log('Polling started (allowed_updates: ' + this.allowedUpdates.join(',') + ')');
       }
+      this.integrationState?.setTelegram('ok');
     } catch (e) {
-      // The API keeps serving (health, panel, tests); outbound messages fail and retry.
-      this.logger.error(`Telegram transport failed to start: ${(e as Error).message}`);
+      const message = (e as Error).message;
+      // VISIBLE degradation: the readiness probe reports it, the panel can show it.
+      this.integrationState?.setTelegram('degraded', message);
+      this.logger.error(`Telegram transport failed to start: ${message}`);
+      if (this.env.NODE_ENV === 'production') {
+        // Production must not pretend to serve a working bot — abort the boot
+        // (the supervisor/container restarts it once Telegram is reachable).
+        throw e;
+      }
+      // Development/test: the API keeps serving (health, panel, tests);
+      // outbound messages fail and retry.
     }
   }
 
@@ -106,6 +139,22 @@ export class TelegrafGateway implements TelegramGateway, OnApplicationBootstrap,
         timeoutMs,
       );
       timer.unref?.(); // never keep the process alive for a pending timeout
+    });
+    request.catch(() => undefined);
+    return Promise.race([request, timeout]) as Promise<T>;
+  }
+
+  /** Races the bootstrap probe against a hard ceiling so the process cannot
+   *  hang before it ever started listening. The timeout loses to a real
+   *  response and rejects with a plain Error otherwise. */
+  private withBootstrapTimeout<T>(request: Promise<T>, timeoutMs: number): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`telegram bootstrap probe timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+      timer.unref?.();
     });
     request.catch(() => undefined);
     return Promise.race([request, timeout]) as Promise<T>;

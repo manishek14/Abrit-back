@@ -60,4 +60,29 @@ describe('AuthService', () => {
       UnauthorizedException,
     );
   });
+
+  // --- review round 6 (P2 session security): GET /auth/me session restore ---
+
+  it('me() returns the public profile of the signed-in admin', async () => {
+    admins.findOne.mockResolvedValueOnce(mkAdmin());
+
+    await expect(service.me('a-1')).resolves.toEqual({
+      id: 'a-1',
+      email: 'admin@abrit.local',
+      name: 'Super Admin',
+    });
+    expect(admins.findOne).toHaveBeenCalledWith({ where: { id: 'a-1' } });
+  });
+
+  it('me() returns the profile WITHOUT the password hash', async () => {
+    admins.findOne.mockResolvedValueOnce(mkAdmin());
+
+    const profile = await service.me('a-1');
+    expect(JSON.stringify(profile)).not.toContain('password_hash');
+  });
+
+  it('me() rejects with 401 when the admin no longer exists (deleted account)', async () => {
+    admins.findOne.mockResolvedValueOnce(null);
+    await expect(service.me('deleted-id')).rejects.toThrow(UnauthorizedException);
+  });
 });

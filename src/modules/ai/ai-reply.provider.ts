@@ -1,6 +1,9 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { getEnv } from '../../config/env';
 import { AI_FALLBACK_MESSAGE, AI_INACTIVE_MESSAGE } from '../../common/ticket-labels';
+import {
+  IntegrationStateService,
+} from '../../common/integration-state/integration-state.service';
 import { SettingsService } from '../settings/settings.service';
 import { ContextBuilderService } from './context-builder.service';
 import { AI_PROVIDER, AiCompleteResult, AiProvider } from './ai-provider.interface';
@@ -20,6 +23,11 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *  - otherwise → context (per-ticket) → OpenRouter with retry/backoff → on
  *    permanent failure/empty → honest fallback message. The user never gets a
  *    blank or contradictory answer, and their message is already stored.
+ *
+ * Review round 6 fix #1: every outcome is reported into the shared
+ * IntegrationStateService, so the readiness probe can REFLECT the OpenRouter
+ * status (disabled / ok / degraded). A temporary AI outage never takes the
+ * API out of service — it is visible, that is all.
  */
 @Injectable()
 export class AiReplyProvider implements ReplyProvider {
@@ -30,8 +38,12 @@ export class AiReplyProvider implements ReplyProvider {
     private readonly settingsService: SettingsService,
     private readonly contextBuilder: ContextBuilderService,
     @Inject(AI_PROVIDER) private readonly provider: AiProvider,
+    private readonly integrationState: IntegrationStateService,
   ) {
     this.semaphore = new Semaphore(getEnv().AI_MAX_CONCURRENCY);
+    if (!getEnv().OPENROUTER_API_KEY) {
+      this.integrationState.setOpenRouter('disabled');
+    }
   }
 
   async reply(input: { ticket: Ticket; userMessage: Message }): Promise<ReplyResult> {
@@ -48,6 +60,7 @@ export class AiReplyProvider implements ReplyProvider {
     if (!env.OPENROUTER_API_KEY) {
       // Per the project owner's instruction the key is intentionally empty for
       // now — no external call happens, the user still gets an honest reply.
+      this.integrationState.setOpenRouter('disabled');
       return {
         content: AI_FALLBACK_MESSAGE,
         meta: { provider: 'fixed', reason: 'api-key-not-configured' },
@@ -77,6 +90,7 @@ export class AiReplyProvider implements ReplyProvider {
 
       const text = result?.text?.trim();
       if (result && text) {
+        this.integrationState.setOpenRouter('ok');
         return {
           content: text,
           meta: {
@@ -107,6 +121,8 @@ export class AiReplyProvider implements ReplyProvider {
       this.logger.error(
         `AI reply failed permanently (${failure?.kind ?? 'unknown'}): ${failure?.message ?? 'no response text'} — sending fallback to user`,
       );
+      // Visible, never fatal: readiness stays 200 while the AI is degraded.
+      this.integrationState.setOpenRouter('degraded', failure?.kind ?? 'unknown');
       return {
         content: AI_FALLBACK_MESSAGE,
         meta: { provider: 'fixed', fallback: true, reason: failure?.kind ?? 'unknown', attempts: attempt },

@@ -8,6 +8,7 @@ import { AssistantSetting } from '../../database/entities/assistant-setting.enti
 import { Ticket } from '../../database/entities/ticket.entity';
 import { Message } from '../../database/entities/message.entity';
 import { AI_FALLBACK_MESSAGE, AI_INACTIVE_MESSAGE } from '../../common/ticket-labels';
+import { IntegrationStateService } from '../../common/integration-state/integration-state.service';
 import { setTestEnv } from '../../common/testing/test-env';
 
 setTestEnv({ OPENROUTER_API_KEY: 'sk-or-test' });
@@ -34,6 +35,7 @@ describe('AiReplyProvider', () => {
   let context: { build: jest.Mock };
   let provider: { complete: jest.Mock };
   let service: AiReplyProvider;
+  let integrationState: IntegrationStateService;
 
   const buildContext = {
     messages: [{ role: 'system' as const, content: 'پرامپت تست' }],
@@ -42,10 +44,12 @@ describe('AiReplyProvider', () => {
   };
 
   const makeService = () => {
+    integrationState = new IntegrationStateService();
     service = new AiReplyProvider(
       settings as unknown as SettingsService,
       context as unknown as ContextBuilderService,
       provider as unknown as AiProvider,
+      integrationState,
     );
   };
 
@@ -94,6 +98,8 @@ describe('AiReplyProvider', () => {
     const req = provider.complete.mock.calls[0][0] as AiCompleteRequest;
     expect(req.messages[0]).toEqual({ role: 'system', content: 'پرامپت تست' });
     expect(req.maxTokens).toBe(500);
+    // review round 6: a successful call proves the integration works
+    expect(integrationState.snapshot().openRouter.status).toBe('ok');
   });
 
   it('retries retryable failures (429/server) and succeeds on the second attempt', async () => {
@@ -137,5 +143,23 @@ describe('AiReplyProvider', () => {
     expect(provider.complete).toHaveBeenCalledTimes(3);
     expect(res.content).toBe(AI_FALLBACK_MESSAGE);
     expect(res.meta).toMatchObject({ fallback: true, reason: 'server', attempts: 3 });
+  });
+
+  it('reports the OpenRouter lifecycle into the shared integration state (round 6)', async () => {
+    // permanent failure → VISIBLE degradation, but never a thrown error
+    provider.complete.mockRejectedValueOnce(
+      new AiProviderError('auth', 'invalid key', false, undefined, 401),
+    );
+    await service.reply(mkInput());
+    expect(integrationState.snapshot().openRouter).toMatchObject({
+      status: 'degraded',
+      detail: 'auth',
+    });
+
+    // no key at all → disabled (never degraded)
+    setTestEnv({ OPENROUTER_API_KEY: '' });
+    makeService();
+    await service.reply(mkInput());
+    expect(integrationState.snapshot().openRouter.status).toBe('disabled');
   });
 });

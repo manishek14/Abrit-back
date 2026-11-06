@@ -3,22 +3,29 @@ import { TelegrafGateway } from './telegraf.gateway';
 import { TelegramApiError } from './telegram-gateway.interface';
 import { DELIVERY_LEASE_MS } from '../messages/messages.service';
 import { parseEnv, type Env } from '../../config/env';
+import { IntegrationStateService } from '../../common/integration-state/integration-state.service';
 
 /**
  * Review round 5 fix #2 — the Telegram request timeout:
  * a send must fail fast (TRANSIENT, retried with backoff) well before its
  * delivery lease expires; previously a hung request outlived the 60 s lease,
  * the sweeper re-claimed the message and a second worker double-sent it.
+ *
+ * Review round 6 fix #1 — bootstrap degradation:
+ * a failed Telegram bootstrap (bad token, unreachable API, failed webhook
+ * registration) must never leave the app looking healthy while the bot is
+ * dead. The gateway now reports the lifecycle into IntegrationStateService
+ * and PRODUCTION refuses to serve at all (the error is rethrown).
  */
-describe('TelegrafGateway (send timeout & error classification)', () => {
-  const mkEnv = (over: Record<string, string> = {}) =>
-    parseEnv({
-      DATABASE_URL: 'postgres://abrit@127.0.0.1:5432/abrit',
-      JWT_SECRET: 'unit-test-secret-value-0123456789',
-      TELEGRAM_BOT_TOKEN: '123:abc',
-      ...over,
-    } as Record<string, string>);
+const mkEnv = (over: Record<string, string> = {}) =>
+  parseEnv({
+    DATABASE_URL: 'postgres://abrit@127.0.0.1:5432/abrit',
+    JWT_SECRET: 'unit-test-secret-value-0123456789',
+    TELEGRAM_BOT_TOKEN: '123:abc',
+    ...over,
+  } as Record<string, string>);
 
+describe('TelegrafGateway (send timeout & error classification)', () => {
   const mkGateway = (env: Env = mkEnv()): TelegrafGateway => {
     const gateway = new TelegrafGateway(env);
     return gateway;
@@ -113,3 +120,118 @@ describe('TelegrafGateway (send timeout & error classification)', () => {
     });
   });
 });
+
+/**
+ * Review round 6 fix #1 — a failed Telegram bootstrap must be VISIBLE.
+ * The old behavior logged the error and kept serving: health stayed green
+ * while the bot was dead. Now the lifecycle lands in IntegrationStateService
+ * (readiness probe + panel) and production aborts the boot entirely.
+ */
+describe('TelegrafGateway (bootstrap degradation)', () => {
+  /** Env for production-mode tests — the production rules demand a 32+ char
+   *  secret, an explicit strong admin password and no demo seeding. */
+  const mkProdEnv = (): Env =>
+    parseEnv({
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgres://abrit@127.0.0.1:5432/abrit',
+      JWT_SECRET: 'prod-secret-0123456789abcdef0123456789abcdef',
+      ADMIN_PASSWORD: 'Prod-Admin-2026!x',
+      SEED_DEMO_DATA: 'false',
+      TELEGRAM_BOT_TOKEN: '123:abc',
+    } as Record<string, string>);
+
+  /** Replaces the whole Telegraf API seam: no network anywhere. */
+  const stubApi = (gateway: TelegrafGateway, impl: Partial<Record<string, jest.Mock>>): void => {
+    (gateway as unknown as { bot: Telegraf }).bot.telegram = {
+      getMe: jest.fn().mockResolvedValue({ id: 1, username: 'abrit_bot' }),
+      setWebhook: jest.fn().mockResolvedValue(undefined),
+      deleteWebhook: jest.fn().mockResolvedValue(undefined),
+      sendMessage: jest.fn(),
+      ...impl,
+    } as unknown as Telegraf['telegram'];
+  };
+
+  it('a successful bootstrap (getMe + launch) reports the integration as ok', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    stubApi(gateway, { getMe: jest.fn().mockResolvedValue({ id: 1, username: 'abrit_bot' }) });
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest.fn().mockResolvedValue(undefined);
+
+    await gateway.onApplicationBootstrap();
+
+    expect(state.snapshot().telegram).toMatchObject({ status: 'ok' });
+  });
+
+  it('a failed bootstrap in development marks the integration degraded and keeps serving', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    stubApi(gateway, {
+      getMe: jest.fn().mockRejectedValue(new Error('401: Unauthorized')),
+    });
+
+    // must NOT throw — the API/panel stay up in development, visibly degraded
+    await expect(gateway.onApplicationBootstrap()).resolves.toBeUndefined();
+
+    expect(state.snapshot().telegram).toMatchObject({
+      status: 'degraded',
+      detail: expect.stringContaining('401'),
+    });
+  });
+
+  it('a failed bootstrap in PRODUCTION rethrows so the process refuses to serve', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkProdEnv(), state);
+    stubApi(gateway, {
+      getMe: jest.fn().mockRejectedValue(new Error('401: Unauthorized')),
+    });
+
+    await expect(gateway.onApplicationBootstrap()).rejects.toThrow('401: Unauthorized');
+    expect(state.snapshot().telegram).toMatchObject({ status: 'degraded' });
+  });
+
+  it('reports "starting" while the bootstrap is still in flight', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    let resolveGetMe: (v: unknown) => void = () => undefined;
+    stubApi(gateway, {
+      getMe: jest.fn().mockReturnValue(new Promise((r) => (resolveGetMe = r))),
+    });
+    (gateway as unknown as { bot: Telegraf }).bot.launch = jest.fn().mockResolvedValue(undefined);
+
+    const bootstrap = gateway.onApplicationBootstrap();
+    expect(state.snapshot().telegram.status).toBe('starting');
+
+    resolveGetMe({ id: 1 });
+    await bootstrap;
+    expect(state.snapshot().telegram.status).toBe('ok');
+  });
+
+  it('a webhook-mode bootstrap failure also degrades (setWebhook rejects)', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv({ TELEGRAM_MODE: 'webhook', TELEGRAM_WEBHOOK_URL: 'https://x.example/api/telegram/webhook', TELEGRAM_WEBHOOK_SECRET: 's3cret-value-01' }), state);
+    stubApi(gateway, {
+      getMe: jest.fn().mockResolvedValue({ id: 1 }),
+      setWebhook: jest.fn().mockRejectedValue(new Error('400: Bad Request')),
+    });
+
+    await expect(gateway.onApplicationBootstrap()).resolves.toBeUndefined();
+    expect(state.snapshot().telegram).toMatchObject({
+      status: 'degraded',
+      detail: expect.stringContaining('400'),
+    });
+  });
+
+  it('a hung getMe cannot stall the boot forever (bounded probe)', async () => {
+    const state = new IntegrationStateService();
+    const gateway = new TelegrafGateway(mkEnv(), state);
+    stubApi(gateway, { getMe: jest.fn().mockReturnValue(new Promise(() => undefined)) });
+
+    // the probe timeout is injected for tests (default 15 s) — 60 ms here
+    await expect(gateway.onApplicationBootstrap(60)).resolves.toBeUndefined();
+    expect(state.snapshot().telegram).toMatchObject({
+      status: 'degraded',
+      detail: expect.stringContaining('timed out'),
+    });
+  });
+});
+
