@@ -133,7 +133,10 @@ export const RawEnvSchema = z
     TELEGRAM_BOT_TOKEN: z.string().default(''),
     TELEGRAM_WEBHOOK_URL: z.string().default(''),
     TELEGRAM_WEBHOOK_SECRET: z.string().default(''),
-    TELEGRAM_ALLOWED_UPDATES: z.string().default('message'),
+    // 'callback_query' is REQUIRED: /mytickets uses inline pagination buttons
+    // (myt:page / myt:view). With 'message' alone those buttons render but a
+    // tap delivers nothing — Telegram silently drops the callback updates.
+    TELEGRAM_ALLOWED_UPDATES: z.string().default('message,callback_query'),
     // Review round 5 fix #2: outbound Telegram requests fail fast as TRANSIENT
     // when hung. MUST stay below the 60 s delivery lease (DELIVERY_LEASE_MS) —
     // a request that could outlive its lease is exactly the double-send window
