@@ -249,3 +249,16 @@ live in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** with
 `.env.production.example`.
 
 License: UNLICENSED (private trial project).
+
+## Sync provenance
+
+- **Sync base:** `manishek14/Abrit@4dde1ca` — monorepo `main` HEAD at
+  extraction time (2026-11-06). Every commit below the extraction commit maps
+  1:1 to a monorepo commit that touched `backend/`; root-level deployment
+  assets (`docs/`, `docker-compose*.yml`, `deploy/`, `ai-usage.txt`) were
+  copied from the monorepo root.
+- Application code is byte-identical to the monorepo subtree (verified by git
+  tree-hash comparison).
+- To sync future monorepo changes: cherry-pick monorepo commits touching
+  `backend/`, or re-run `git filter-branch --subdirectory-filter backend` on
+  the monorepo and merge.
